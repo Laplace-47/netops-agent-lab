@@ -10,7 +10,10 @@ from netops_agent.planner import MockPlanner, Planner
 from netops_agent.registry import ToolDefinition, ToolRegistry
 from netops_agent.runtime import ToolRuntime
 from netops_agent.service import RunService
-from netops_agent.tools import FindWarningArgs, GetTrafficArgs, find_warning, get_traffic
+from netops_agent.tools import (
+    DiagnoseNodeArgs, FindWarningArgs, GetDeviceArgs, GetTrafficArgs,
+    diagnose_node, find_warning, get_device, get_traffic,
+)
 
 
 def create_app(planner: Planner | None = None) -> FastAPI:
@@ -26,6 +29,14 @@ def create_app(planner: Planner | None = None) -> FastAPI:
         description="按节点和时间范围查询模拟流量利用率",
         args_model=GetTrafficArgs,
         handler=get_traffic,
+    ))
+    registry.register(ToolDefinition(
+        name="get_device", description="按节点查询模拟设备信息",
+        args_model=GetDeviceArgs, handler=get_device,
+    ))
+    registry.register(ToolDefinition(
+        name="diagnose_node", description="根据传入的模拟设备、告警和流量证据生成诊断",
+        args_model=DiagnoseNodeArgs, handler=diagnose_node,
     ))
     planner = planner or MockPlanner(timezone_name=os.getenv("NETOPS_TIMEZONE", "Asia/Shanghai"))
     service = RunService(planner, ToolRuntime(registry))

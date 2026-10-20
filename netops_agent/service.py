@@ -5,7 +5,8 @@ import logging
 from datetime import datetime, timezone
 from uuid import UUID
 
-from netops_agent.models import ParallelPlan, RunError, RunRecord, ToolCall, ToolExecution
+from netops_agent.dag import execute_dag
+from netops_agent.models import DAGPlan, ParallelPlan, RunError, RunRecord, ToolCall, ToolExecution
 from netops_agent.orchestration import execute_parallel
 from netops_agent.planner import Planner, UnsupportedRequest
 from netops_agent.runtime import ToolRuntime
@@ -24,7 +25,9 @@ class RunService:
         self._runs[run.run_id] = run
         try:
             call = await self.planner.plan(message, self.runtime.registry.schemas())
-            if isinstance(call, ParallelPlan):
+            if isinstance(call, DAGPlan):
+                await self._execute_dag(run, call)
+            elif isinstance(call, ParallelPlan):
                 await self._execute_parallel(run, call)
             else:
                 run.tool_call = ToolCall.model_validate(call)
@@ -71,6 +74,32 @@ class RunService:
                 message=str(metadata.get("message", "工具执行失败。")),
             )
         run.answer = self._summarize_parallel(run.tool_executions)
+
+    async def _execute_dag(self, run: RunRecord, plan: DAGPlan) -> None:
+        # 模型可能在构造后被修改，执行前再次校验并深拷贝，避免修改 Planner 的计划。
+        run.plan = DAGPlan.model_validate(plan).model_copy(deep=True)
+        run.tool_executions = [ToolExecution(
+            tool_call=step.tool_call, depends_on=step.depends_on, bindings=step.bindings,
+        ) for step in run.plan.steps]
+        await execute_dag(self.runtime, run.tool_executions)
+        failed = [entry for entry in run.tool_executions if entry.status == "failed"]
+        blocked = [entry for entry in run.tool_executions if entry.status == "blocked"]
+        run.status = "failed" if failed or blocked else "succeeded"
+        if failed or blocked:
+            entry = (failed or blocked)[0]
+            run.error = RunError(
+                code=entry.error.code,
+                message=f"步骤 {entry.tool_call.id}（{entry.tool_call.name}）：{entry.error.message}",
+            )
+        parts = []
+        for entry in run.tool_executions:
+            if entry.status == "succeeded":
+                summaries = [row["summary"] for row in entry.result.content
+                             if isinstance(row.get("summary"), str)]
+                parts.extend(summaries or [f"{entry.tool_call.name} 成功"])
+            else:
+                parts.append(f"{entry.tool_call.name} {entry.status}（{entry.error.code}）")
+        run.answer = "【模拟结果】" + "；".join(parts)
 
     @staticmethod
     def _summarize_parallel(executions: list[ToolExecution]) -> str:
