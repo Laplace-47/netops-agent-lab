@@ -1,8 +1,8 @@
-"""find_warning 参数契约与原创模拟告警工具；不包含外部请求。"""
+"""告警和流量工具的参数契约及原创模拟数据；不包含外部请求。"""
 
 from datetime import timedelta
 from enum import Enum
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import AwareDatetime, Field, model_validator
 
@@ -36,6 +36,28 @@ class WarningRecord(Contract):
     description: str
 
 
+class GetTrafficArgs(Contract):
+    node_id: str = Field(min_length=1)
+    begin_time: AwareDatetime
+    end_time: AwareDatetime
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        if self.end_time <= self.begin_time:
+            raise ValueError("end_time 必须晚于 begin_time")
+        return self
+
+
+class TrafficRecord(Contract):
+    traffic_id: str
+    node_id: str
+    begin_time: AwareDatetime
+    end_time: AwareDatetime
+    utilization_percent: float = Field(ge=0, le=100)
+    traffic_level: Literal["LOW", "MEDIUM", "HIGH"]
+    description: str
+
+
 async def find_warning(args: FindWarningArgs) -> ToolResult:
     # 为请求起始日生成固定模拟样本，使演示不依赖运行日期或外部数据。
     # 这不是历史告警数据库，也不声称这些告警真实发生过。
@@ -62,4 +84,18 @@ async def find_warning(args: FindWarningArgs) -> ToolResult:
         metadata={"source": "mock", "count": len(warnings)},
         content=[row.model_dump(mode="json") for row in warnings],
         indexes=[row.warning_id for row in warnings],
+    )
+
+
+async def get_traffic(args: GetTrafficArgs) -> ToolResult:
+    # 固定演示利用率；对任意合法节点和窗口返回相同等级，不代表真实观测值。
+    record = TrafficRecord(
+        traffic_id="mock-traffic-001", node_id=args.node_id,
+        begin_time=args.begin_time, end_time=args.end_time,
+        utilization_percent=72.5, traffic_level="HIGH",
+        description="模拟：请求时间范围内的演示流量利用率为 72.5%，等级 HIGH",
+    )
+    return ToolResult(
+        type="success", metadata={"source": "mock", "count": 1},
+        content=[record.model_dump(mode="json")], indexes=[record.traffic_id],
     )

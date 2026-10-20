@@ -1,10 +1,10 @@
 """API、Planner 和 Runtime 之间共享的数据契约。"""
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Literal, Self
 from uuid import UUID, uuid4
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 
 class Contract(BaseModel):
@@ -25,6 +25,21 @@ class ToolCall(Contract):
     arguments: dict[str, JsonValue]
 
 
+class ParallelPlan(Contract):
+    """调用之间无依赖；列表顺序也是执行记录和汇总结果的展示顺序。"""
+
+    model_config = ConfigDict(revalidate_instances="always")
+
+    mode: Literal["parallel"] = "parallel"
+    tool_calls: list[ToolCall] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def check_unique_call_ids(self) -> Self:
+        if len({call.id for call in self.tool_calls}) != len(self.tool_calls):
+            raise ValueError("并行计划的 ToolCall.id 必须唯一")
+        return self
+
+
 class ToolResult(Contract):
     """content 为结构化记录，indexes 为对应记录 ID；空列表可成功。"""
 
@@ -34,6 +49,12 @@ class ToolResult(Contract):
     metadata: dict[str, JsonValue]
     content: list[dict[str, JsonValue]]
     indexes: list[str]
+
+
+class ToolExecution(Contract):
+    tool_call: ToolCall
+    status: Literal["pending", "running", "succeeded", "failed", "cancelled"] = "pending"
+    result: ToolResult | None = None
 
 
 class RunError(Contract):
@@ -49,5 +70,7 @@ class RunRecord(Contract):
     completed_at: AwareDatetime | None = None
     tool_call: ToolCall | None = None
     result: ToolResult | None = None
+    plan: ParallelPlan | None = None
+    tool_executions: list[ToolExecution] = Field(default_factory=list)
     answer: str | None = None
     error: RunError | None = None

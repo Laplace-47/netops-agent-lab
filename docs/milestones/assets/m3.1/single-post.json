@@ -1,0 +1,42 @@
+{
+  "run_id": "ef006515-7f62-42e8-99fc-625810cccb27",
+  "message": "查询 node_20 昨天的严重告警",
+  "status": "succeeded",
+  "created_at": "2026-10-20T11:12:24.697504Z",
+  "completed_at": "2026-10-20T11:12:24.700696Z",
+  "tool_call": {
+    "id": "15dcdc87-9315-4e39-bd07-9659916e0cad",
+    "name": "find_warning",
+    "arguments": {
+      "node_id": "node_20",
+      "begin_time": "2026-10-19T00:00:00+08:00",
+      "end_time": "2026-10-20T00:00:00+08:00",
+      "severe_level": "CRITICAL"
+    }
+  },
+  "result": {
+    "type": "success",
+    "metadata": {
+      "source": "mock",
+      "count": 1,
+      "tool_name": "find_warning",
+      "tool_call_id": "15dcdc87-9315-4e39-bd07-9659916e0cad"
+    },
+    "content": [
+      {
+        "warning_id": "mock-warning-001",
+        "node_id": "node_20",
+        "severe_level": "CRITICAL",
+        "occurred_at": "2026-10-19T10:00:00+08:00",
+        "description": "模拟：CPU 使用率超过严重告警阈值"
+      }
+    ],
+    "indexes": [
+      "mock-warning-001"
+    ]
+  },
+  "plan": null,
+  "tool_executions": [],
+  "answer": "【模拟结果】node_20 昨天共有 1 条严重告警。",
+  "error": null
+}
