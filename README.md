@@ -1,25 +1,29 @@
 # NetOps Agent Lab
 
-> 最新可演示阶段为 **M3.1：多工具并发执行与结果汇总**。已支持“综合查询 node_20 昨天的告警和流量”，
-> Swagger 入口为 `http://127.0.0.1:8000/docs`；复现步骤、实际响应截图和最新测试记录见
-> [M3.1 交付总结与演示](docs/milestones/M3.1.md#5-本机-swagger-demo-与复现步骤2026-10-20)。
-> 下文保留 M2 阶段的说明和历史验证记录，当前 M3.1 能力及演示以该文档为准。全部网络数据均为模拟数据。
+> 最新可演示阶段为 **M3.2：DAG 依赖调度与上游结果传递**。支持单工具、独立工具并发和四步依赖诊断。
+> Swagger 入口为 `http://127.0.0.1:8000/docs`；已有旧服务占用端口时，可另用 8001 启动当前版本。
+> 阶段记录：[M3.1 交付总结与演示](docs/milestones/M3.1.md)、[M3.2 交付总结与执行记录](docs/milestones/M3.2.md)。
+> 所有设备、告警、流量和诊断数据均为模拟数据，不代表真实网络监控结果。
 
 智能网管多工具 Agent 与可靠执行平台的原创学习工程。在 **M0 + M1** 工程初始化与最小 Agent 闭环基础上，
-已实现 **M2：Tool Runtime 可靠性改造**，包含单次执行超时、有限重试和异常分类。
+已完成 M2 的单次执行超时、有限重试和异常分类，M3.1 的独立工具并发，以及 M3.2 的 DAG 调度与结果绑定。
 代码实现、自动化测试通过与整体验收是不同状态，见下文验证记录。
 
-只使用自行编写的代码、公开技术资料和模拟告警数据。当前不连接真实 LLM、内部网络或涉密接口。
+只使用自行编写的代码、公开技术资料和模拟数据。当前不连接真实 LLM、真实网络或涉密接口。
 
 ## 当前开发边界
 
 - FastAPI `POST /runs` 和 `GET /runs/{run_id}`。
-- Mock Planner、Tool Registry、Tool Runtime 和一个 `find_warning` 工具。
-- Pydantic v2 参数校验、统一 ToolResult、内存 Run 存储。
+- Mock Planner 输出 `ToolCall`、`ParallelPlan` 或 `DAGPlan`，由显式契约决定执行路径。
+- Tool Registry 注册 `find_warning`、`get_traffic`、`get_device`、`diagnose_node` 四个模拟工具。
+- Pydantic v2 参数及计划校验、统一 ToolResult、单进程内存 Run 存储和深拷贝查询。
 - Tool Runtime 单次异步执行超时、有限重试，以及显式的临时错误和业务错误分类。
-- pytest 自动化测试及本机 HTTP 验证。
+- `asyncio.gather` 执行独立调用；DAG 按就绪批次复用并发执行，并向下游绑定上游结果。
+- 逐工具记录、失败隔离、依赖失败阻断、取消传播与确定性模拟汇总。
+- pytest 自动化测试及已有的本机 HTTP 验证记录。
 
-本次 M2 改造沿用现有 Planner、API 和 ToolResult 数据结构，没有新增调度或持久化模块。
+当前没有真实 LLM、Queue、Worker、Checkpoint、数据库持久化、SSE 或 RAG。
+M3.2 复用 M2 Runtime 和 M3.1 并发模块，没有重写原有可靠性逻辑。
 
 ## 目录与职责
 
@@ -33,12 +37,27 @@
 │   ├── registry.py
 │   ├── runtime.py
 │   ├── tools.py
+│   ├── orchestration.py
+│   ├── dag.py
 │   └── service.py
 ├── tests/
 │   ├── conftest.py
 │   ├── test_runs.py
 │   ├── test_runtime.py
-│   └── test_planner.py
+│   ├── test_planner.py
+│   ├── test_parallel_runs.py
+│   ├── test_traffic.py
+│   ├── test_dag_models.py
+│   ├── test_dag_runs.py
+│   └── test_diagnostic_tools.py
+├── docs/
+│   └── milestones/
+│       ├── M3.1.md
+│       ├── M3.2.md
+│       └── assets/
+│           ├── m3.1/
+│           └── m3.2/
+├── M2_ACCEPTANCE_CHECKLIST.md
 ├── README.md
 ├── requirements.txt
 ├── pyproject.toml
@@ -48,19 +67,28 @@
 
 | 文件 | 核心职责 |
 | --- | --- |
-| `main.py` | `create_app()` 组装依赖，提供 POST/GET 接口，每个应用拥有独立内存存储 |
+| `main.py` | `create_app()` 注册四个工具、组装依赖，提供 POST/GET；每个应用拥有独立内存存储 |
 | `netops_agent/__init__.py` | Python 包声明 |
-| `netops_agent/models.py` | 请求、ToolCall、ToolResult、RunRecord 和 RunError 数据契约 |
-| `netops_agent/planner.py` | `Planner` 协议、`MockPlanner.plan()` 和业务时区的“昨天”换算 |
+| `netops_agent/models.py` | 请求、ToolCall、ParallelPlan、DAGPlan、DAGStep、ResultBinding、执行记录及 Run 契约；检查依赖和绑定规则 |
+| `netops_agent/planner.py` | `Planner` 协议、三类请求的 Mock 计划和业务时区的“昨天”换算 |
 | `netops_agent/registry.py` | `ToolDefinition` 和 `ToolRegistry`；注册、查找、导出 JSON Schema |
 | `netops_agent/runtime.py` | `ToolRuntime.execute()`；参数校验、单次执行超时、有限重试、返回值校验；定义 TemporaryToolError / BusinessToolError 并转换错误 |
-| `netops_agent/tools.py` | `FindWarningArgs`、等级枚举、时间范围校验和模拟 `find_warning()` |
-| `netops_agent/service.py` | `RunService.create_run()/get_run()`；任务状态、结果汇总和内存快照 |
+| `netops_agent/tools.py` | 四个工具及参数/证据模型；模拟设备、告警、流量，以及根据输入证据计算的诊断 |
+| `netops_agent/orchestration.py` | `execute_parallel()`；独立调用并发、收集分支结果，取消时清理子任务并传播信号 |
+| `netops_agent/dag.py` | `execute_dag()`；就绪批次、content 深拷贝绑定、blocked 传播和 DAG 取消记录 |
+| `netops_agent/service.py` | `RunService.create_run()/get_run()`；选择三条执行路径，保存计划、调用、结果、错误和汇总 |
 | `tests/conftest.py` | 固定业务时钟、独立应用、asyncio 测试后端及工具测试夹具 |
-| `tests/test_runs.py` | API 成功、空结果、失败、查询、输入校验、结果快照测试 |
+| `tests/test_runs.py` | 基础 API、M2 故障保存、重试成功、服务取消及结果快照测试 |
 | `tests/test_runtime.py` | 参数与结果校验、工具查找、超时与重试、实际执行次数、异常分类、取消清理及配置边界测试 |
 | `tests/test_planner.py` | 自然语言映射、业务时区和不支持的请求测试 |
-| `requirements.txt` | 固定此次验证的直接依赖版本，包含运行和测试依赖 |
+| `tests/test_parallel_runs.py` | ParallelPlan、确定性并发、部分失败、独立重试、取消及 POST/GET 回归 |
+| `tests/test_traffic.py` | 流量工具注册、参数校验、统一结构和模拟结果重复性 |
+| `tests/test_dag_models.py` | DAG 结构、依赖、绑定及可变模型重新校验 |
+| `tests/test_dag_runs.py` | DAG Planner、就绪步骤并发、结果传递、失败阻断、取消清理及 API 保存 |
+| `tests/test_diagnostic_tools.py` | 设备/诊断工具注册、输入证据校验及空证据行为 |
+| `docs/milestones/M3.1.md`、`M3.2.md` | 分阶段实现、测试和 HTTP 证据；assets 保存实际模拟响应与演示截图 |
+| `M2_ACCEPTANCE_CHECKLIST.md` | M2 早期只读审查快照，不作为当前测试覆盖状态的唯一依据 |
+| `requirements.txt` | 固定运行与测试的直接依赖版本 |
 | `pyproject.toml` | pytest 目录、导入路径及 marker 配置 |
 | `.gitignore` | 排除虚拟环境、缓存、日志、构建产物和 `.env` |
 | `.env.example` | 无秘密的环境变量示例；不自动加载 `.env` |
@@ -68,7 +96,7 @@
 
 ## 运行
 
-要求 Python 3.11+。本次实际验证使用 Windows / Python 3.12.6。
+要求 Python 3.11+。已有阶段验证记录使用 Windows / Python 3.12.6。
 在项目根目录执行以下命令（Windows 的 PowerShell 或 Git Bash）：
 
 ```text
@@ -78,6 +106,15 @@ python -m venv .venv
 ```
 
 访问 <http://127.0.0.1:8000/docs> 可交互提交请求。本项目当前不提供认证，演示启动绑定本机地址。
+
+已运行的旧进程不会因为磁盘代码更新而自动升级。若 8000 被旧演示占用，可保留它，另启当前代码：
+
+```text
+.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
+```
+
+对应访问 <http://127.0.0.1:8001/docs>，并把后文请求地址的端口改为 8001。
+里程碑中的端口、Run ID 和当时提交状态属于历史快照，不能据此假定某个旧进程目前仍在运行。
 
 Linux/macOS 对应使用 `.venv/bin/python`。默认业务时区为 `Asia/Shanghai`，可通过进程环境变量
 `NETOPS_TIMEZONE` 修改；`tzdata` 提供 Windows 所需的时区数据。`.env.example` 仅作说明，
@@ -90,45 +127,77 @@ POST /runs {message}
   -> FastAPI / CreateRunRequest 校验请求
   -> RunService 创建 running Run，并保存到内存
   -> MockPlanner.plan(message, registry.schemas())
-  -> ToolCall(id, name="find_warning", arguments)
-  -> ToolRuntime / ToolRegistry.get(name)
-  -> FindWarningArgs.model_validate(arguments)
-  -> asyncio.wait_for(handler(args), timeout=5.0)
-     -> 成功返回：退出执行循环
-     -> TimeoutError / TemporaryToolError：在共享预算内额外重试，最多执行 4 次
-     -> BusinessToolError / 其他未预期异常：立即返回对应错误
-  -> ToolResult 校验并关联 tool_call_id
+     -> ToolCall：直接调用 ToolRuntime.execute()
+     -> ParallelPlan：execute_parallel() 并发调用各工具的 Runtime
+     -> DAGPlan：execute_dag() 分批选择依赖均成功的步骤
+        -> 按显式绑定复制上游 content 到当前参数
+        -> execute_parallel() 并发执行本批次的 Runtime 调用
+        -> 保存结果，继续调度；依赖失败的步骤标记 blocked
+  -> 各 ToolRuntime：Registry 查找 -> Pydantic 参数校验
+     -> wait_for(handler(args), timeout=5.0)，在预算内处理超时/临时错误重试
+     -> ToolResult 校验并关联 tool_name / tool_call_id
   -> RunService 生成确定性的模拟回答
   -> 保存 succeeded / failed Run
   -> HTTP 201 + Location: /runs/{run_id}
 
 GET /runs/{run_id}
-  -> 读取内存快照 -> HTTP 200
+  -> 读取已保存记录的深拷贝 -> HTTP 200，不重新执行工具
 ```
 
 POST 在请求内等待工具执行完毕，不使用后台任务、Queue 或 Worker。HTTP 201 表示 Run 资源创建成功，
 执行是否成功看 `status`。不支持的自然语言也会保存为失败 Run，便于通过 GET 查看原因。
 
-当前支持“查询 node_编号 昨天的严重/警告/信息告警”，可省略节点两侧空格。
-Mock Planner 将三种中文等级分别映射到 `CRITICAL/WARNING/INFO`，并返回一次工具调用。
+Mock Planner 当前支持以下三类明确表达，可省略节点两侧空格：
+
+| 请求示例 | 计划与执行 |
+| --- | --- |
+| `查询 node_20 昨天的严重告警` | ToolCall：find_warning；也支持“警告/信息”，分别映射 WARNING/INFO，严重映射 CRITICAL |
+| `综合查询 node_20 昨天的告警和流量` | ParallelPlan：find_warning 与 get_traffic 独立并发 |
+| `诊断 node_20 昨天的设备状态、告警和流量` | DAGPlan：get_device 后执行告警/流量，最后根据上游结果诊断 |
+
+组合查询与诊断中的告警等级固定为 `CRITICAL`。告警和流量共用同一节点及业务时区下昨天的起止时间。
 同一个逻辑 ToolCall 可以在 Runtime 内多次尝试执行；重试不重新调用 Planner，tool_call_id 保持一致。
 其他表达明确返回 `UNSUPPORTED_REQUEST`，不会偷偷改为默认节点查询。
+
+### M3.2 诊断依赖与绑定
+
+| 步骤 | 直接依赖 | 参数与结果传递 |
+| --- | --- | --- |
+| `get_device` | 无 | 按 node_id 返回模拟设备基础信息 |
+| `find_warning` | get_device | 成功后才允许执行；节点、严重等级和昨天时间来自 Planner |
+| `get_traffic` | get_device | 与告警步骤同批并发；节点和昨天时间来自 Planner |
+| `diagnose_node` | get_device、find_warning、get_traffic | 分别将上游 content 绑定到 device_info、warnings、traffic，结合 node_id 生成诊断 |
+
+告警和流量对设备步骤是控制依赖，不会从设备 content 中提取查询参数。诊断显式直接依赖设备步骤，
+以满足设备结果绑定必须来自直接依赖的规则。get_device 不接收时间范围，不提供历史设备状态查询。
+
+DAGStep 复用 ToolCall.id 作为步骤 ID。模型拒绝空计划、重复 ID、未知依赖、自依赖、环、重复依赖、
+非直接依赖来源绑定、重复绑定目标，以及绑定与静态参数冲突；DAG 入口也重新校验被修改过的 ToolCall 实例。
+绑定只支持完整 `ToolResult.content` 到顶层参数，不支持任意 JSONPath、表达式或嵌套目标。
+
+调度按就绪批次执行：本批全部结束后再计算下一批。上游成功 content 会深拷贝注入下游，再经过 Runtime 参数校验；
+原计划不会写入绑定值，执行记录保存实际注入后的调用参数。诊断只计算传入证据，记录来源 ID，不在工具内部另造一份设备、告警或流量结果。
+
+某步骤失败时，其他独立分支仍继续完成。失败依赖的下游为 `blocked`、错误码 `DEPENDENCY_FAILED`，
+`result=null`，不会执行 handler，也不会把错误结果当成空成功传入下游。告警失败时仍保留成功流量结果，但诊断不执行。
+所有步骤均成功时 Run 为 succeeded；存在 failed 或 blocked 步骤时为 failed，保留各分支实际结果和可解释错误。
 
 ## 数据契约与错误边界
 
 `ToolCall` 使用 `id`、`name`、`arguments`，其中 arguments 是 JSON 对象。
 未来 LLM 适配器需将供应商响应转换到此模型，继续复用 Registry 和 Runtime。
 
-`find_warning` 参数均必填：
+四个工具均使用 Pydantic 参数模型，下表字段均为必填：
 
-| 参数 | 校验 |
+| 工具 | 参数与校验 |
 | --- | --- |
-| `node_id` | 非空字符串 |
-| `severe_level` | `INFO` / `WARNING` / `CRITICAL` |
-| `begin_time` | 带时区的 datetime，JSON 输入使用 ISO 8601 字符串 |
-| `end_time` | 带时区的 datetime，必须严格晚于 begin_time |
+| `find_warning` | node_id 非空字符串；severe_level 为 INFO / WARNING / CRITICAL；begin_time、end_time 带时区且 end_time 严格晚于 begin_time |
+| `get_traffic` | node_id 非空字符串；begin_time、end_time 同样校验时区和先后关系 |
+| `get_device` | node_id 非空字符串 |
+| `diagnose_node` | node_id、device_info、warnings、traffic；设备列表恰好 1 条，告警/流量列表允许为空；记录符合各自模型且节点一致，流量时间范围有效 |
 
-查询采用 `[begin_time, end_time)`。未知参数被拒绝，参数校验失败不会执行工具。
+时间输入使用 ISO 8601 字符串。告警查询采用 `[begin_time, end_time)`；流量工具使用传入时间窗口生成模拟记录。
+未知参数被拒绝，参数校验失败不会执行工具。
 跨字段时间顺序由 Pydantic model validator 检查，不能仅依赖 JSON Schema 表达。
 
 `ToolResult` 始终包含四个字段：
@@ -148,6 +217,18 @@ Mock Planner 将三种中文等级分别映射到 `CRITICAL/WARNING/INFO`，并�
 HTTP 请求格式非法时返回 422，未知 Run 返回 404。Planner 失败保存为 failed Run。
 协程取消会记录 failed/CANCELLED 并继续向上传播取消信号。
 
+Run 保存 `run_id`、message、状态、创建/完成时间、answer 和顶层 error，执行内容按计划类型区分：
+
+| 执行路径 | `tool_call` / `result` | `plan` / `tool_executions` |
+| --- | --- | --- |
+| 单工具 | 保存原有调用及结果 | null / [] |
+| ParallelPlan | null / null | 保存并行计划，以及按计划顺序保存的各调用、状态和结果 |
+| DAGPlan | null / null | 保存原始 DAG，以及各步骤的实际调用、依赖、绑定、状态、结果和 error |
+
+DAG 步骤状态包含 pending、running、succeeded、failed、blocked、cancelled；Run 状态仍为 running、succeeded、failed。
+ParallelPlan 错误沿用逐工具 `result.metadata` 和顶层 Run.error，执行记录的独立 error 字段默认 null；DAG 路径会填充逐步骤 error。
+多工具失败时保留成功分支；顶层错误按计划顺序选取首个失败，DAG 优先选实际 failed 步骤，其次才是 blocked 步骤。
+
 ## M2：Tool Runtime 可靠性
 
 ### 默认配置与重试预算
@@ -164,6 +245,8 @@ ToolRuntime(registry, timeout=5.0, max_retries=3)
 - 首次成功即返回；在第 4 次尝试成功仍属于允许范围。预算耗尽时，按最后一次失败返回错误码。
 - 参数校验发生在执行循环前，返回值校验发生在执行循环后；它们的失败不会触发重试。
 - 每次尝试创建新的 handler 协程。当前没有重试退避或抖动策略。
+
+该预算针对每个工具调用独立计算，ParallelPlan / DAG 不额外增加重试，也不让其他成功分支重复执行。
 
 配置只通过 Runtime 构造参数注入；当前 `main.py` 使用默认值，没有新增 HTTP 或环境变量配置入口。
 测试可传入更短超时，例如 `ToolRuntime(registry, timeout=0.01, max_retries=3)`。
@@ -202,7 +285,43 @@ RunService 继续读取结果中的错误码和说明保存 failed Run；工具�
 因此默认 5 秒不代表硬性终止时限，4 次尝试也不能推导为整个 Run 必定在 20 秒内结束。
 当前没有进程级强制终止或隔离执行能力。
 
+并行及 DAG 取消时会取消未完成子任务、等待清理后继续传播 CancelledError；DAG 尚未调度的步骤也标记 cancelled，
+已完成结果保留。取消路径保存 Run 的 failed/CANCELLED 和完成时间，不会将取消转换为临时故障重试。
+
 ## 请求与响应示例
+
+### 当前 DAG 诊断请求
+
+在 Swagger 中展开 `POST /runs`，点击 **Try it out**，提交：
+
+```json
+{"message":"诊断 node_20 昨天的设备状态、告警和流量"}
+```
+
+Git Bash 中的等价请求为：
+
+```bash
+curl -i -X POST http://127.0.0.1:8000/runs \
+  -H 'Content-Type: application/json' \
+  --data '{"message":"诊断 node_20 昨天的设备状态、告警和流量"}'
+```
+
+在当前模拟样本中，四步成功时可看到设备 UP、1 条严重告警、流量 72.5% / HIGH 和派生诊断 CRITICAL。
+这些都是模拟结果，不能宣传为真实网络观测或真实故障结论。完整响应参考
+[M3.2 交付时实际保存的 DAG 记录](docs/milestones/assets/m3.2/dag-run.json)，不是本次 README 更新重新请求所得。
+
+POST 正常返回 201 及 Location；复制本次返回的 run_id，调用 `GET /runs/{run_id}`，可取回相同的状态、结果和汇总。
+在 Git Bash 中把下面变量替换为新建 Run 的实际 ID：
+
+```bash
+run_id='替换为本次POST返回的run_id'
+curl "http://127.0.0.1:8000/runs/$run_id"
+```
+
+独立并发演示使用 `{"message":"综合查询 node_20 昨天的告警和流量"}`；单工具使用
+`{"message":"查询 node_20 昨天的严重告警"}`。三种请求共用 POST/GET 接口。
+
+### 历史 M1 单工具响应（2026-10-12）
 
 服务启动后，在 Git Bash 中执行：
 
@@ -212,7 +331,8 @@ curl -i -X POST http://127.0.0.1:8000/runs \
   --data '{"message":"查询node_20昨天的严重告警"}'
 ```
 
-下面是 2026-10-12 本机真实 HTTP 验证的一次响应；ID 与运行时间每次不同：
+下面保留 2026-10-12 本机 HTTP 验证的原始单工具响应。它是 M1 的历史字段结构；
+当前单工具响应另外包含默认 `plan=null`、`tool_executions=[]`。ID 与运行时间每次不同：
 
 ```json
 {
@@ -274,27 +394,42 @@ content=[]、indexes=[]。空结果表示查询成功，不会转换成工具失
 | --- | --- |
 | M0 + M1 代码 | 工程初始化、模拟 Agent 闭环及内存 Run 查询已实现，保留原有行为 |
 | M2 代码 | Tool Runtime 超时、有限重试、显式异常分类已实现；实现提交为 `837c1579c7ef348a004296f199c20171287b493b` |
-| M2 自动化测试 | 本次 README 更新前核对代码并复跑完整套件，60 项通过；更新后的完整回归结果也记录于下文 |
-| M2 整体工程验收 | 待确认，尚未标记全部完成；本次工作核对文档和自动化回归，未执行新的完整工程验收流程 |
+| M3.1 代码 | 独立工具并发、逐工具结果保存和汇总已实现；随 `fed1b6a` 提交保留了 M2 的 API 测试及文档 |
+| M3.2 代码 | 静态 DAG 依赖校验、结果绑定、就绪批次调度及失败阻断已实现；当前 main 实现提交为 `0924ce0` |
+| M3.2 自动化测试 | 交付文档记录完整套件 `157 passed in 2.56s`，包括此前 96 项和新增 61 项 |
+| 工程验收边界 | 已有下述自动化和历史 HTTP 证据；不将这些用例扩大为大规模图、任意 handler 或整个项目全部功能的验收通过 |
 
-代码已提交或推送不等于整体验收完成。历史 HTTP 检查记录作为已有证据保留，
-不冒充本次文档更新新执行的检查，也不据此宣称整体项目已完成。
+代码已提交或推送不等于整体验收完成。里程碑文档保留各阶段当时的审查和提交状态，当前代码状态以 main 为准。
+历史 HTTP 检查记录作为已有证据保留，不冒充本次 README 更新新执行的检查。
 
-### 当前完整测试套件
+### M3.2 交付测试记录（2026-10-20）
 
-本次 README 更新使用 Windows / Python 3.12.6 执行现有完整套件：
+以下命令和结果摘自 [M3.2 交付文档第 3 节](docs/milestones/M3.2.md#3-测试命令及实际结果)，
+是该次交付实际执行的完整套件记录：
 
 ```text
 .venv/Scripts/python.exe -B -m pytest -q -W error -p no:cacheprovider
-60 passed
+157 passed in 2.56s
+退出码：0
 ```
+
+**本次 README 更新只核对代码、测试源码、交付文档和 Git Diff，没有重新运行 pytest、启动服务或执行 HTTP 验证。**
+上述耗时和通过数量不是本次文档更新新产生的结果。M3.2 交付时新增测试记录为 `61 passed in 0.98s`。
 
 `-p no:cacheprovider` 仅关闭 pytest 结果缓存，以避开本机旧缓存目录权限问题；
 保留全部测试和警告检查。`-B` 避免写入字节码。该记录只说明已执行的自动化测试结果。
 
-原有覆盖包括成功查询、空结果、非法枚举、错误时间范围、必填字段、无时区时间、半开区间过滤、
-未知工具、重复注册、工具异常、非法返回结构、Planner 异常、Schema、API 和结果快照隔离。
-本次可靠性改造的现有测试还覆盖：
+当前测试源码覆盖单工具与 ParallelPlan 回归、DAG 结构/绑定校验、无序计划、根节点和中间就绪批次并发、
+依赖顺序、深拷贝、绑定后参数校验、失败阻断、独立分支保留、真实上游证据驱动诊断、POST/GET 一致性及取消清理。
+并发测试使用 asyncio.Event 建立握手，不仅通过执行时间差推测并发。
+
+M2 的 Runtime 测试及后补的 Run API 测试也保留在完整套件中。现有 `tests/test_runs.py` 已覆盖
+TIMEOUT / TEMPORARY_ERROR / BUSINESS_ERROR 的保存查询、重试成功及服务层取消；
+[M2 早期验收清单](M2_ACCEPTANCE_CHECKLIST.md) 中相关缺口是当时的审查快照，不能继续当作当前缺少这些用例的结论。
+
+### 保留的 M2 Runtime 测试断言
+
+以下是现有测试源码中的断言范围，源于 M2 可靠性改造，不是本次重新执行的结果：
 
 | 测试场景 | 实际断言 |
 | --- | --- |
@@ -337,27 +472,38 @@ No broken requirements found.
 POST/GET 能保存并查询相同的结果和错误码。该临时服务验证后已关闭。
 这是此前执行记录，不属于仓库中独立的 HTTP 验收脚本，也未在本次 README 更新中重新执行。
 
+### 历史 M3.1 / M3.2 HTTP 演示与验证
+
+- [M3.1 交付及 Swagger 演示](docs/milestones/M3.1.md)：初次总结复跑完整套件为 `96 passed in 1.39s`，
+  随后的演示复跑为 `96 passed in 1.36s`；实际验证组合 POST 201、GET 200、响应一致和单工具回归，保存了截图与原始 JSON。
+- [M3.2 交付记录](docs/milestones/M3.2.md)：在临时 8001 服务上验证四步 DAG、绑定参数与上游 content 相等、
+  POST 201 / GET 200 完整一致，以及单工具和 ParallelPlan 回归。该临时服务验证后正常关闭，验证期间保留了旧 8000 演示服务。
+
+这些属于历史执行证据。本次没有重跑以上演示；Run 仍只保存于相应服务进程的内存中。
+
 ## Git 与秘密管理
 
-旧 main.py 保存在初始 Git 提交中，新工程没有继续调用旧实现。M0、M1、M2 代码分阶段维护提交。
+旧 main.py 保存在初始 Git 提交中，新工程没有继续调用旧实现。M0、M1、M2、M3.1、M3.2 代码分阶段维护提交。
 `.env`、虚拟环境、缓存和日志均不纳入 Git；只有无秘密的 `.env.example` 会提交。
 推送前检查暂存文件及常见秘密格式。不要将真实网络数据或秘密加入后续提交。
 
 ## 当前限制与后续方向
 
-- 仅一个模拟工具和规则 Planner，最终回答由代码汇总，尚未接入 LLM。
+- 四个工具均为模拟工具；Planner 只识别上述三类规则表达，最终回答由代码确定性汇总，没有真实 LLM。
 - 内存存储只适用于单进程；重启、热重载会丢失 Run，多个进程不共享数据，也没有容量回收。
 - 没有后台 Worker、队列、持久化、Checkpoint、幂等和任务恢复。
 - 已有单次异步执行超时与有限重试；尚无重试退避、抖动、整个 Run 的总超时或按工具分别配置的执行策略。
 - 取消依赖 handler 配合，尚无同步阻塞隔离或对任意代码强制终止的能力。
-- 没有多工具编排和并发控制；重试也不提供业务操作幂等保证。
+- 已有独立工具并发和静态 DAG 调度；尚无并发数量上限，大规模 DAG 性能未经验证，也没有条件/可选步骤或动态增图。
+- 结果绑定仅限直接依赖的完整 content 到顶层参数；所有 DAG 步骤都视为必要步骤，失败会影响整个 Run。
+- get_device 不提供历史设备状态库；get_traffic 固定返回模拟利用率 72.5% / HIGH，不能作为真实网络监控指标。
+- 连续多次取消、吞掉取消信号的 handler 等边界尚未专门验证；重试也不提供业务操作幂等保证。
 - 没有 SSE、结构化 Trace、RAG、Elasticsearch、Rerank、Redis、PostgreSQL、Docker 或 CI。
 - 没有用户认证和生产部署配置。
 
-下一步先明确 M2 整体工程验收清单，结合现有测试与历史记录，核对故障注入和 Run API 的端到端行为，
-补齐验收结论。已实现的超时和有限重试不再列为待开发功能。
-后续可另立阶段扩展重试退避、幂等及结构化 Trace，再逐步接入真实 LLM Planner、编排和持久化模块；
-这些都尚未实现。本次只同步 README，不扩展功能，也不自动提交或推送。
+后续可单独规划并发上限、大规模图和取消边界验证，再按阶段扩展重试退避、幂等、Trace、
+真实 LLM 或持久化等能力。已有的 Timeout/Retry、ParallelPlan 和静态 DAG 调度不再列为待开发功能。
+本次只更新 README，不扩展功能，不提交或推送 Git。
 
 ## 公开技术参考
 
