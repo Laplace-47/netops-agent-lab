@@ -1,3 +1,5 @@
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -42,12 +44,53 @@ def anyio_backend():
     return "asyncio"
 
 
+class RunClient(AsyncClient):
+    """显式排空队列再查最终结果；不改变 POST 的后台执行契约。"""
+
+    def __init__(self, app):
+        super().__init__(transport=ASGITransport(app=app), base_url="http://test")
+        self.service = app.state.run_service
+
+    async def completed_run(self, response):
+        assert response.status_code == 202
+        assert response.json()["status"] == "queued"
+        assert response.json()["completed_at"] is None
+        assert response.headers["location"] == f"/runs/{response.json()['run_id']}"
+        await asyncio.wait_for(self.service.queue.join(), timeout=2)
+        fetched = await self.get(response.headers["location"])
+        assert fetched.status_code == 200
+        return fetched.json()
+
+
 @pytest.fixture
-async def client(planner):
-    async with AsyncClient(
-        transport=ASGITransport(app=create_app(planner=planner)), base_url="http://test",
-    ) as client:
+def client_factory():
+    @asynccontextmanager
+    async def build(app):
+        # ASGITransport 不自动运行 lifespan，必须显式启动和关闭 Worker。
+        async with app.router.lifespan_context(app), RunClient(app) as client:
+            yield client
+    return build
+
+
+@pytest.fixture
+async def client(planner, client_factory):
+    async with client_factory(create_app(planner=planner)) as client:
         yield client
+
+
+@pytest.fixture
+def run_to_completion():
+    async def execute(service, message):
+        # 执行层单元测试独立驱动一次出队，便于直接验证 CancelledError 传播。
+        # 真正的长期 Worker 和生命周期另有 API 集成测试覆盖。
+        submitted = await service.create_run(message)
+        run_id = service.queue.get_nowait()
+        assert run_id == submitted.run_id
+        try:
+            return await service.execute_run(run_id)
+        finally:
+            service.queue.task_done()
+    return execute
 
 
 @pytest.fixture

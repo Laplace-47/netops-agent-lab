@@ -78,8 +78,8 @@ async def test_diagnostic_planner_requires_all_tools(planner, missing):
 
 async def test_diagnostic_post_get_preserve_plan_bound_arguments_and_results(client):
     response = await client.post("/runs", json={"message": DIAGNOSIS})
-    assert response.status_code == 201
-    run = response.json()
+    assert response.status_code == 202
+    run = await client.completed_run(response)
     assert run["status"] == "succeeded" and run["error"] is None
     assert run["tool_call"] is None and run["result"] is None
     assert run["plan"]["mode"] == "dag"
@@ -102,7 +102,7 @@ async def test_diagnostic_post_get_preserve_plan_bound_arguments_and_results(cli
 
 @pytest.mark.parametrize("failed_tool", ["get_device", "find_warning"])
 async def test_diagnostic_failure_blocks_required_descendants_without_losing_traffic(
-    monkeypatch, planner, failed_tool,
+    monkeypatch, planner, client_factory, failed_tool,
 ):
     calls = Counter()
     originals = {"get_device": get_device, "find_warning": find_warning,
@@ -119,9 +119,9 @@ async def test_diagnostic_failure_blocks_required_descendants_without_losing_tra
     for name in originals:
         monkeypatch.setattr(f"main.{name}", observed(name))
     app = create_app(planner)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with client_factory(app) as client:
         response = await client.post("/runs", json={"message": DIAGNOSIS})
-        run = response.json()
+        run = await client.completed_run(response)
         entries = {entry["tool_call"]["name"]: entry for entry in run["tool_executions"]}
         assert run["status"] == "failed" and run["error"]["code"] == "BUSINESS_ERROR"
         assert entries[failed_tool]["status"] == "failed" and calls[failed_tool] == 1
@@ -133,11 +133,11 @@ async def test_diagnostic_failure_blocks_required_descendants_without_losing_tra
         else:
             assert entries["get_traffic"]["status"] == "succeeded" and calls["get_traffic"] == 1
             assert entries["get_traffic"]["result"]["content"][0]["utilization_percent"] == 72.5
-        assert "DO_NOT_EXPOSE_INTERNAL_DETAILS" not in response.text
+        assert "DO_NOT_EXPOSE_INTERNAL_DETAILS" not in str(run)
         assert (await client.get(response.headers["location"])).json() == run
 
 
-async def test_root_steps_run_concurrently_and_unordered_dependency_waits(dag_app_factory):
+async def test_root_steps_run_concurrently_and_unordered_dependency_waits(dag_app_factory, run_to_completion):
     started = {name: asyncio.Event() for name in ("a", "b")}
     release = asyncio.Event()
     calls = Counter()
@@ -156,7 +156,7 @@ async def test_root_steps_run_concurrently_and_unordered_dependency_waits(dag_ap
 
     plan = DAGPlan(steps=[step("sink", ["a", "b"]), step("b"), step("a")])
     service = dag_app_factory(plan, {"a": root, "b": root, "sink": sink}).state.run_service
-    task = asyncio.create_task(service.create_run("模拟并发根节点"))
+    task = asyncio.create_task(run_to_completion(service, "模拟并发根节点"))
     try:
         await asyncio.wait_for(asyncio.gather(*(e.wait() for e in started.values())), timeout=1)
         assert calls == {"a": 1, "b": 1} and not task.done()
@@ -169,7 +169,7 @@ async def test_root_steps_run_concurrently_and_unordered_dependency_waits(dag_ap
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_device_then_ready_branches_then_diagnosis_uses_event_barriers(monkeypatch, planner):
+async def test_device_then_ready_branches_then_diagnosis_uses_event_barriers(monkeypatch, planner, run_to_completion):
     device_started, release_device = asyncio.Event(), asyncio.Event()
     branch_started = {name: asyncio.Event() for name in ("warning", "traffic")}
     release_branches = asyncio.Event()
@@ -207,7 +207,7 @@ async def test_device_then_ready_branches_then_diagnosis_uses_event_barriers(mon
                           ("get_traffic", traffic), ("diagnose_node", diagnosis)]:
         monkeypatch.setattr(f"main.{name}", handler)
     service = create_app(planner).state.run_service
-    task = asyncio.create_task(service.create_run(DIAGNOSIS))
+    task = asyncio.create_task(run_to_completion(service, DIAGNOSIS))
     try:
         await asyncio.wait_for(device_started.wait(), timeout=1)
         assert calls == {"device": 1}
@@ -226,7 +226,7 @@ async def test_device_then_ready_branches_then_diagnosis_uses_event_barriers(mon
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_content_bindings_are_deep_copies_and_leave_plan_unchanged(dag_app_factory):
+async def test_content_bindings_are_deep_copies_and_leave_plan_unchanged(dag_app_factory, run_to_completion):
     mutated = asyncio.Event()
     payload = [{"nested": {"values": [7]}}]
 
@@ -247,8 +247,9 @@ async def test_content_bindings_are_deep_copies_and_leave_plan_unchanged(dag_app
     binding = ResultBinding(source_step_id="source", target_argument="records")
     plan = DAGPlan(steps=[step("source"), step("mutate", ["source"], [binding]),
                           step("observe", ["source"], [binding])])
-    run = await dag_app_factory(plan, {"source": source, "mutate": mutate,
-                                      "observe": observe}).state.run_service.create_run("模拟绑定")
+    service = dag_app_factory(plan, {"source": source, "mutate": mutate,
+                                     "observe": observe}).state.run_service
+    run = await run_to_completion(service, "模拟绑定")
     assert run.status == "succeeded"
     assert run.tool_executions[0].result.content == [{"nested": {"values": [7]}}]
     assert run.tool_executions[1].tool_call.arguments["records"] == payload
@@ -262,7 +263,7 @@ async def test_content_bindings_are_deep_copies_and_leave_plan_unchanged(dag_app
     ("returned_error", "TEMPORARY_ERROR", 1), ("unexpected", "TOOL_EXECUTION_ERROR", 1),
 ])
 async def test_failed_upstream_blocks_descendants_but_preserves_other_branch(
-    dag_app_factory, monkeypatch, failure, code, attempts,
+    dag_app_factory, monkeypatch, client_factory, failure, code, attempts,
 ):
     calls, cleanups = Counter(), Counter()
     bad_finished = asyncio.Event()
@@ -319,9 +320,9 @@ async def test_failed_upstream_blocks_descendants_but_preserves_other_branch(
             bad_finished.set()
         return result
     monkeypatch.setattr(runtime, "execute", observed_execute)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with client_factory(app) as client:
         response = await asyncio.wait_for(client.post("/runs", json={"message": "模拟失败 DAG"}), timeout=1)
-        run = response.json()
+        run = await client.completed_run(response)
         records = {e["tool_call"]["id"]: e for e in run["tool_executions"]}
         assert run["status"] == "failed" and run["error"]["code"] == code
         assert records["bad"]["status"] == "failed"
@@ -335,11 +336,11 @@ async def test_failed_upstream_blocks_descendants_but_preserves_other_branch(
         assert calls["source"] == calls["good"] == calls["good_child"] == 1
         assert calls["bad"] == attempts
         assert cleanups["bad"] == (attempts if failure == "timeout" else 0)
-        assert "DO_NOT_EXPOSE_INTERNAL_DETAILS" not in response.text
+        assert "DO_NOT_EXPOSE_INTERNAL_DETAILS" not in str(run)
         assert (await client.get(response.headers["location"])).json() == run
 
 
-async def test_bound_arguments_are_validated_by_runtime_before_handler(dag_app_factory):
+async def test_bound_arguments_are_validated_by_runtime_before_handler(dag_app_factory, run_to_completion):
     calls = Counter()
 
     async def source(args):
@@ -353,14 +354,15 @@ async def test_bound_arguments_are_validated_by_runtime_before_handler(dag_app_f
     plan = DAGPlan(steps=[step("source"), step("sink", ["source"], [
         ResultBinding(source_step_id="source", target_argument="tag"),
     ], arguments={})])
-    run = await dag_app_factory(plan, {"source": source, "sink": sink}).state.run_service.create_run("模拟校验")
+    service = dag_app_factory(plan, {"source": source, "sink": sink}).state.run_service
+    run = await run_to_completion(service, "模拟校验")
     assert run.status == "failed" and run.error.code == "INVALID_ARGUMENTS"
     assert calls == {"source": 1}
     assert run.tool_executions[1].tool_call.arguments["tag"] == [{"not": "a string"}]
 
 
 @pytest.mark.parametrize("first_failure", ["temporary", "timeout"])
-async def test_dag_retry_success_only_passes_final_success_downstream(dag_app_factory, first_failure):
+async def test_dag_retry_success_only_passes_final_success_downstream(dag_app_factory, run_to_completion, first_failure):
     calls = Counter()
 
     async def source(args):
@@ -378,11 +380,14 @@ async def test_dag_retry_success_only_passes_final_success_downstream(dag_app_fa
     plan = DAGPlan(steps=[step("source"), step("sink", ["source"], [
         ResultBinding(source_step_id="source", target_argument="records"),
     ])])
-    run = await dag_app_factory(plan, {"source": source, "sink": sink}, timeout=0.01).state.run_service.create_run("模拟重试")
+    service = dag_app_factory(plan, {"source": source, "sink": sink}, timeout=0.01).state.run_service
+    run = await run_to_completion(service, "模拟重试")
     assert run.status == "succeeded" and calls == {"source": 2, "sink": 1}
 
 
-async def test_diagnosis_uses_modified_upstream_evidence_instead_of_fixed_samples(monkeypatch, planner, valid_arguments):
+async def test_diagnosis_uses_modified_upstream_evidence_instead_of_fixed_samples(
+    monkeypatch, planner, valid_arguments, run_to_completion,
+):
     async def device(args):
         return success([{"device_id": "sentinel-device", "node_id": args.node_id,
                          "name": "模拟替代设备", "state": "DOWN", "description": "模拟"}])
@@ -398,7 +403,7 @@ async def test_diagnosis_uses_modified_upstream_evidence_instead_of_fixed_sample
                          "utilization_percent": 5.0, "traffic_level": "LOW", "description": "模拟替代流量"}])
     for name, handler in [("get_device", device), ("find_warning", warning), ("get_traffic", traffic)]:
         monkeypatch.setattr(f"main.{name}", handler)
-    run = await create_app(planner).state.run_service.create_run(DIAGNOSIS)
+    run = await run_to_completion(create_app(planner).state.run_service, DIAGNOSIS)
     assert run.status == "succeeded"
     result = run.tool_executions[-1].result.content[0]
     assert result["device_state"] == "DOWN"
@@ -414,7 +419,7 @@ async def test_diagnosis_uses_modified_upstream_evidence_instead_of_fixed_sample
 @pytest.mark.parametrize("stage", ["root", "branches"])
 @pytest.mark.parametrize("cancel_source", ["external", "child"])
 async def test_dag_cancel_propagates_waits_for_cleanup_and_saves_future_steps(
-    dag_app_factory, stage, cancel_source,
+    dag_app_factory, run_to_completion, stage, cancel_source,
 ):
     names = ("root", "left", "right", "sink")
     started = {name: asyncio.Event() for name in names}
@@ -446,7 +451,7 @@ async def test_dag_cancel_propagates_waits_for_cleanup_and_saves_future_steps(
                           step("sink", ["left", "right"])])
     app = dag_app_factory(plan, {name: handler for name in names})
     service = app.state.run_service
-    task = asyncio.create_task(service.create_run("模拟取消 DAG"))
+    task = asyncio.create_task(run_to_completion(service, "模拟取消 DAG"))
     try:
         await asyncio.wait_for(asyncio.gather(*(started[name].wait() for name in active)), timeout=1)
         run_id, = service._runs

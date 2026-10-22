@@ -1,6 +1,7 @@
 """FastAPI 入口：python -m uvicorn main:app --host 127.0.0.1 --port 8000。"""
 
 import os
+from contextlib import asynccontextmanager
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Response
@@ -40,12 +41,24 @@ def create_app(planner: Planner | None = None) -> FastAPI:
     ))
     planner = planner or MockPlanner(timezone_name=os.getenv("NETOPS_TIMEZONE", "Asia/Shanghai"))
     service = RunService(planner, ToolRuntime(registry))
-    app = FastAPI(title="NetOps Agent Lab", version="0.1.0")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await service.start()
+        try:
+            yield
+        finally:
+            await service.stop()
+
+    app = FastAPI(title="NetOps Agent Lab", version="0.1.0", lifespan=lifespan)
     app.state.run_service = service
 
-    @app.post("/runs", response_model=RunRecord, status_code=201)
+    @app.post("/runs", response_model=RunRecord, status_code=202)
     async def create_run(request: CreateRunRequest, response: Response) -> RunRecord:
-        run = await service.create_run(request.message)
+        try:
+            run = await service.create_run(request.message)
+        except RuntimeError:
+            raise HTTPException(status_code=503, detail="服务正在关闭，暂不接收任务。") from None
         response.headers["Location"] = f"/runs/{run.run_id}"
         return run
 

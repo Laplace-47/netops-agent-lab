@@ -132,7 +132,7 @@ class ToolExecution(Contract):
 class RunRecord(Contract):
     run_id: UUID = Field(default_factory=uuid4)
     message: str
-    status: Literal["running", "succeeded", "failed"] = "running"
+    status: Literal["queued", "running", "succeeded", "failed"] = "queued"
     created_at: AwareDatetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: AwareDatetime | None = None
     tool_call: ToolCall | None = None

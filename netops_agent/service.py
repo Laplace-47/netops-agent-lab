@@ -1,4 +1,4 @@
-"""请求内完成 Run 执行，并在单进程内存中保存可查询的快照。"""
+"""内存队列提交、单 Worker 执行及可查询的 Run 快照。"""
 
 import asyncio
 import logging
@@ -19,12 +19,87 @@ class RunService:
         self.planner = planner
         self.runtime = runtime
         self._runs: dict[UUID, RunRecord] = {}
+        self.queue: asyncio.Queue[UUID] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._closing = False
 
     async def create_run(self, message: str) -> RunRecord:
+        """只保存和入队，不执行 Planner，也不为每个 Run 创建后台任务。"""
+        if self._closing:
+            raise RuntimeError("RunService 正在关闭，不能提交任务。")
         run = RunRecord(message=message)
         self._runs[run.run_id] = run
+        # 无界内存队列的入队不让出控制权，返回的快照始终为 queued。
+        self.queue.put_nowait(run.run_id)
+        return run.model_copy(deep=True)
+
+    async def start(self) -> None:
+        if self._worker_task is not None and not self._worker_task.done():
+            return
+        self._closing = False
+        self._worker_task = asyncio.create_task(self._work(), name="netops-run-worker")
+
+    async def stop(self) -> None:
+        """停止接收任务，取消当前执行并等待清理；排空尚未执行的任务。"""
+        worker = self._worker_task
+        if not self._closing and worker is not None and not worker.done():
+            worker.cancel()
+        self._closing = True
         try:
-            call = await self.planner.plan(message, self.runtime.registry.schemas())
+            if worker is not None:
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    # 区分 Worker 自身的取消与关闭协程被外部取消。
+                    # 后者也先等待资源释放，再继续传播取消信号。
+                    if asyncio.current_task().cancelling():
+                        await asyncio.gather(worker, return_exceptions=True)
+                        raise
+        finally:
+            while not self.queue.empty():
+                run_id = self.queue.get_nowait()
+                try:
+                    run = self._runs[run_id]
+                    if run.status == "queued":
+                        self._fail_run(run, "CANCELLED", "服务关闭，任务尚未执行。")
+                finally:
+                    self.queue.task_done()
+
+    async def _work(self) -> None:
+        while True:
+            run_id = await self.queue.get()
+            try:
+                await self.execute_run(run_id)
+            except asyncio.CancelledError:
+                run = self._runs.get(run_id)
+                if run is not None:
+                    self._fail_run(run, "CANCELLED", "任务执行已取消。")
+                if asyncio.current_task().cancelling():
+                    raise
+                # handler/编排子任务自行取消只结束当前 Run，消费者继续服务。
+            except Exception:
+                logger.exception("Worker 处理 Run %s 失败", run_id)
+                run = self._runs.get(run_id)
+                if run is not None:
+                    self._fail_run(run, "INTERNAL_ERROR", "任务执行发生异常。")
+            finally:
+                self.queue.task_done()
+
+    @staticmethod
+    def _fail_run(run: RunRecord, code: str, message: str) -> None:
+        run.status = "failed"
+        run.error = RunError(code=code, message=message)
+        run.answer = None
+        run.completed_at = datetime.now(timezone.utc)
+
+    async def execute_run(self, run_id: UUID) -> RunRecord:
+        """由 Worker 调用；复用已有的单工具、ParallelPlan 和 DAG 执行链。"""
+        run = self._runs[run_id]
+        if run.status != "queued":
+            return run.model_copy(deep=True)
+        run.status = "running"
+        try:
+            call = await self.planner.plan(run.message, self.runtime.registry.schemas())
             if isinstance(call, DAGPlan):
                 await self._execute_dag(run, call)
             elif isinstance(call, ParallelPlan):

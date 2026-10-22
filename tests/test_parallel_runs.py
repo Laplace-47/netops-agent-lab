@@ -64,8 +64,8 @@ async def test_parallel_plan_contract_rejects_ambiguous_plan(valid_arguments, ca
 
 async def test_combined_post_and_get_preserve_both_results(client):
     response = await client.post("/runs", json={"message": COMBINED_MESSAGE})
-    assert response.status_code == 201
-    run = response.json()
+    assert response.status_code == 202
+    run = await client.completed_run(response)
     assert run["status"] == "succeeded" and run["error"] is None
     assert run["tool_call"] is None and run["result"] is None
     assert run["plan"]["mode"] == "parallel"
@@ -88,14 +88,15 @@ async def test_combined_post_and_get_preserve_both_results(client):
 async def test_single_query_keeps_original_fields_and_call_type(client, planner, registry):
     call = await planner.plan("查询 node_20 昨天的严重告警", registry.schemas())
     assert isinstance(call, ToolCall)
-    run = (await client.post("/runs", json={"message": "查询 node_20 昨天的严重告警"})).json()
+    response = await client.post("/runs", json={"message": "查询 node_20 昨天的严重告警"})
+    run = await client.completed_run(response)
     assert run["status"] == "succeeded"
     assert run["tool_call"]["name"] == "find_warning"
     assert run["result"]["type"] == "success"
     assert run["plan"] is None and run["tool_executions"] == []
 
 
-async def test_parallel_tools_start_before_either_is_released(monkeypatch, planner):
+async def test_parallel_tools_start_before_either_is_released(monkeypatch, planner, client_factory):
     started = {name: asyncio.Event() for name in ("warning", "traffic")}
     release = asyncio.Event()
     traffic_finished = asyncio.Event()
@@ -119,25 +120,26 @@ async def test_parallel_tools_start_before_either_is_released(monkeypatch, plann
     monkeypatch.setattr("main.find_warning", warning_handler)
     monkeypatch.setattr("main.get_traffic", traffic_handler)
     app = create_app(planner=planner)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        request = asyncio.create_task(client.post("/runs", json={"message": COMBINED_MESSAGE}))
+    async with client_factory(app) as client:
+        response = await client.post("/runs", json={"message": COMBINED_MESSAGE})
+        assert response.status_code == 202 and response.json()["status"] == "queued"
+        completion = asyncio.create_task(client.completed_run(response))
         try:
             await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started.values())), timeout=1)
             assert calls == {"warning": 1, "traffic": 1}
-            assert not request.done()  # 两个 handler 已启动，但都没拿到放行信号。
+            assert not completion.done()  # POST 已返回，两个 handler 尚未拿到放行信号。
             release.set()
-            response = await asyncio.wait_for(request, timeout=1)
-            run = response.json()
+            run = await asyncio.wait_for(completion, timeout=1)
             assert run["status"] == "succeeded"
             assert [r["tool_call"]["name"] for r in run["tool_executions"]] == ["find_warning", "get_traffic"]
         finally:
             release.set()
-            request.cancel()
-            await asyncio.gather(request, return_exceptions=True)
+            completion.cancel()
+            await asyncio.gather(completion, return_exceptions=True)
 
 
 @pytest.mark.parametrize("failed_tool", ["find_warning", "get_traffic"])
-async def test_failed_branch_still_collects_later_success(monkeypatch, planner, failed_tool):
+async def test_failed_branch_still_collects_later_success(monkeypatch, planner, client_factory, failed_tool):
     failed_finished = asyncio.Event()
     success_started = asyncio.Event()
     calls = {"find_warning": 0, "get_traffic": 0}
@@ -168,10 +170,10 @@ async def test_failed_branch_still_collects_later_success(monkeypatch, planner, 
         return result
 
     monkeypatch.setattr(runtime, "execute", observed_execute)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with client_factory(app) as client:
         response = await asyncio.wait_for(client.post("/runs", json={"message": COMBINED_MESSAGE}), timeout=1)
-        run = response.json()
-        assert response.status_code == 201 and run["status"] == "failed"
+        run = await client.completed_run(response)
+        assert response.status_code == 202 and run["status"] == "failed"
         assert run["error"]["code"] == "BUSINESS_ERROR"
         records = {r["tool_call"]["name"]: r for r in run["tool_executions"]}
         assert records[failed_tool]["status"] == "failed"
@@ -179,13 +181,13 @@ async def test_failed_branch_still_collects_later_success(monkeypatch, planner, 
         assert records[successful_tool]["status"] == "succeeded"
         assert records[successful_tool]["result"]["type"] == "success"
         assert "告警查询" in run["answer"] and "流量查询" in run["answer"]
-        assert "DO_NOT_EXPOSE_INTERNAL_DETAILS" not in response.text
+        assert "DO_NOT_EXPOSE_INTERNAL_DETAILS" not in str(run)
         assert (await client.get(response.headers["location"])).json() == run
         assert calls == {"find_warning": 1, "get_traffic": 1}
 
 
 @pytest.mark.parametrize("failure", ["timeout", "temporary"])
-async def test_exhausted_traffic_keeps_successful_warning(monkeypatch, planner, failure):
+async def test_exhausted_traffic_keeps_successful_warning(monkeypatch, planner, client_factory, failure):
     calls = {"warning": 0, "traffic": 0}
 
     async def warning_handler(args):
@@ -203,9 +205,9 @@ async def test_exhausted_traffic_keeps_successful_warning(monkeypatch, planner, 
     app = create_app(planner=planner)
     service = app.state.run_service
     service.runtime = ToolRuntime(service.runtime.registry, timeout=0.01)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with client_factory(app) as client:
         response = await asyncio.wait_for(client.post("/runs", json={"message": COMBINED_MESSAGE}), timeout=1)
-        run = response.json()
+        run = await client.completed_run(response)
         code = "TIMEOUT" if failure == "timeout" else "TEMPORARY_ERROR"
         assert run["status"] == "failed" and run["error"]["code"] == code
         assert [r["status"] for r in run["tool_executions"]] == ["succeeded", "failed"]
@@ -215,7 +217,7 @@ async def test_exhausted_traffic_keeps_successful_warning(monkeypatch, planner, 
         assert calls == {"warning": 1, "traffic": 4}
 
 
-async def test_traffic_retry_does_not_repeat_successful_peer(monkeypatch, planner):
+async def test_traffic_retry_does_not_repeat_successful_peer(monkeypatch, planner, run_to_completion):
     calls = {"warning": 0, "traffic": 0}
 
     async def warning_handler(args):
@@ -231,13 +233,15 @@ async def test_traffic_retry_does_not_repeat_successful_peer(monkeypatch, planne
     monkeypatch.setattr("main.find_warning", warning_handler)
     monkeypatch.setattr("main.get_traffic", traffic_handler)
     app = create_app(planner=planner)
-    run = await app.state.run_service.create_run(COMBINED_MESSAGE)
+    run = await run_to_completion(app.state.run_service, COMBINED_MESSAGE)
     assert run.status == "succeeded"
     assert calls == {"warning": 1, "traffic": 2}
 
 
 @pytest.mark.parametrize("cancel_source", ["external", "child"])
-async def test_parallel_cancellation_propagates_and_cleans_children(monkeypatch, planner, cancel_source):
+async def test_parallel_cancellation_propagates_and_cleans_children(
+    monkeypatch, planner, run_to_completion, cancel_source,
+):
     started = {name: asyncio.Event() for name in ("warning", "traffic")}
     trigger = asyncio.Event()
     calls = {"warning": 0, "traffic": 0}
@@ -264,7 +268,7 @@ async def test_parallel_cancellation_propagates_and_cleans_children(monkeypatch,
     monkeypatch.setattr("main.get_traffic", traffic_handler)
     app = create_app(planner=planner)
     service = app.state.run_service
-    task = asyncio.create_task(service.create_run(COMBINED_MESSAGE))
+    task = asyncio.create_task(run_to_completion(service, COMBINED_MESSAGE))
     try:
         await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started.values())), timeout=1)
         run_id, = service._runs
@@ -291,9 +295,9 @@ async def test_parallel_cancellation_propagates_and_cleans_children(monkeypatch,
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_combined_snapshot_isolation(parallel_app):
+async def test_combined_snapshot_isolation(parallel_app, run_to_completion):
     service = parallel_app.state.run_service
-    run = await service.create_run(COMBINED_MESSAGE)
+    run = await run_to_completion(service, COMBINED_MESSAGE)
     run.tool_executions[0].result.content.clear()
     run.plan.tool_calls.clear()
     saved = service.get_run(run.run_id)
