@@ -1,19 +1,21 @@
 # NetOps Agent Lab
 
-> 最新可演示阶段为 **M3.2：DAG 依赖调度与上游结果传递**。支持单工具、独立工具并发和四步依赖诊断。
+> 最新已实现阶段为 **M4.1：Queue / Worker 后台执行**。支持异步提交单工具、独立工具并发和四步 DAG 诊断。
 > Swagger 入口为 `http://127.0.0.1:8000/docs`；已有旧服务占用端口时，可另用 8001 启动当前版本。
-> 阶段记录：[M3.1 交付总结与演示](docs/milestones/M3.1.md)、[M3.2 交付总结与执行记录](docs/milestones/M3.2.md)。
+> 阶段记录：[M3.1](docs/milestones/M3.1.md)、[M3.2](docs/milestones/M3.2.md)、[M4.1 交付总结与执行证据](docs/milestones/M4.1.md)。
 > 所有设备、告警、流量和诊断数据均为模拟数据，不代表真实网络监控结果。
 
 智能网管多工具 Agent 与可靠执行平台的原创学习工程。在 **M0 + M1** 工程初始化与最小 Agent 闭环基础上，
-已完成 M2 的单次执行超时、有限重试和异常分类，M3.1 的独立工具并发，以及 M3.2 的 DAG 调度与结果绑定。
+已完成 M2 的单次执行超时、有限重试和异常分类，M3.1 的独立工具并发、M3.2 的 DAG 调度与结果绑定，
+以及 M4.1 的内存队列和单个后台 Worker。M4.1 实现已随 `4f17ff2400a1426f77206dd7e9d95ef37a7a6921` 提交并推送到 main。
 代码实现、自动化测试通过与整体验收是不同状态，见下文验证记录。
 
 只使用自行编写的代码、公开技术资料和模拟数据。当前不连接真实 LLM、真实网络或涉密接口。
 
 ## 当前开发边界
 
-- FastAPI `POST /runs` 和 `GET /runs/{run_id}`。
+- FastAPI `POST /runs` 返回 HTTP 202、queued 和 run_id；`GET /runs/{run_id}` 查询最新状态。
+- `asyncio.Queue` 保存待执行 run_id，单个长期 Worker 消费；FastAPI lifespan 管理启动和关闭。
 - Mock Planner 输出 `ToolCall`、`ParallelPlan` 或 `DAGPlan`，由显式契约决定执行路径。
 - Tool Registry 注册 `find_warning`、`get_traffic`、`get_device`、`diagnose_node` 四个模拟工具。
 - Pydantic v2 参数及计划校验、统一 ToolResult、单进程内存 Run 存储和深拷贝查询。
@@ -22,8 +24,9 @@
 - 逐工具记录、失败隔离、依赖失败阻断、取消传播与确定性模拟汇总。
 - pytest 自动化测试及已有的本机 HTTP 验证记录。
 
-当前没有真实 LLM、Queue、Worker、Checkpoint、数据库持久化、SSE 或 RAG。
-M3.2 复用 M2 Runtime 和 M3.1 并发模块，没有重写原有可靠性逻辑。
+Queue 和 Run 存储均为单进程内存实现，暂不支持持久化、崩溃恢复和多进程共享。
+当前没有真实 LLM、Claim/Lease、Checkpoint、数据库持久化、SSE 或 RAG。
+M4.1 复用原有 Planner、Runtime、并行和 DAG 执行链，没有重写工具业务逻辑。
 
 ## 目录与职责
 
@@ -54,6 +57,7 @@ M3.2 复用 M2 Runtime 和 M3.1 并发模块，没有重写原有可靠性逻辑
 │   └── milestones/
 │       ├── M3.1.md
 │       ├── M3.2.md
+│       ├── M4.1.md
 │       └── assets/
 │           ├── m3.1/
 │           └── m3.2/
@@ -67,7 +71,7 @@ M3.2 复用 M2 Runtime 和 M3.1 并发模块，没有重写原有可靠性逻辑
 
 | 文件 | 核心职责 |
 | --- | --- |
-| `main.py` | `create_app()` 注册四个工具、组装依赖，提供 POST/GET；每个应用拥有独立内存存储 |
+| `main.py` | `create_app()` 注册四个工具、组装依赖；lifespan 启停 Worker；POST 提交返回 202，GET 查询快照 |
 | `netops_agent/__init__.py` | Python 包声明 |
 | `netops_agent/models.py` | 请求、ToolCall、ParallelPlan、DAGPlan、DAGStep、ResultBinding、执行记录及 Run 契约；检查依赖和绑定规则 |
 | `netops_agent/planner.py` | `Planner` 协议、三类请求的 Mock 计划和业务时区的“昨天”换算 |
@@ -76,9 +80,9 @@ M3.2 复用 M2 Runtime 和 M3.1 并发模块，没有重写原有可靠性逻辑
 | `netops_agent/tools.py` | 四个工具及参数/证据模型；模拟设备、告警、流量，以及根据输入证据计算的诊断 |
 | `netops_agent/orchestration.py` | `execute_parallel()`；独立调用并发、收集分支结果，取消时清理子任务并传播信号 |
 | `netops_agent/dag.py` | `execute_dag()`；就绪批次、content 深拷贝绑定、blocked 传播和 DAG 取消记录 |
-| `netops_agent/service.py` | `RunService.create_run()/get_run()`；选择三条执行路径，保存计划、调用、结果、错误和汇总 |
-| `tests/conftest.py` | 固定业务时钟、独立应用、asyncio 测试后端及工具测试夹具 |
-| `tests/test_runs.py` | 基础 API、M2 故障保存、重试成功、服务取消及结果快照测试 |
+| `netops_agent/service.py` | `create_run()` 保存 queued 并入队；`start()/stop()` 管理单 Worker；`execute_run()` 复用三条执行路径并保存结果；`get_run()` 返回深拷贝。队列和 Run 字典均在此模块中，无独立 Worker 文件或进程 |
+| `tests/conftest.py` | 固定时钟、工具夹具、显式 lifespan 客户端，以及排空队列后查询最终结果的辅助方法 |
+| `tests/test_runs.py` | 基础 API、M2 故障保存与重试；M4.1 提交解耦、状态查询、Worker 故障隔离、FIFO 和关闭清理 |
 | `tests/test_runtime.py` | 参数与结果校验、工具查找、超时与重试、实际执行次数、异常分类、取消清理及配置边界测试 |
 | `tests/test_planner.py` | 自然语言映射、业务时区和不支持的请求测试 |
 | `tests/test_parallel_runs.py` | ParallelPlan、确定性并发、部分失败、独立重试、取消及 POST/GET 回归 |
@@ -86,7 +90,7 @@ M3.2 复用 M2 Runtime 和 M3.1 并发模块，没有重写原有可靠性逻辑
 | `tests/test_dag_models.py` | DAG 结构、依赖、绑定及可变模型重新校验 |
 | `tests/test_dag_runs.py` | DAG Planner、就绪步骤并发、结果传递、失败阻断、取消清理及 API 保存 |
 | `tests/test_diagnostic_tools.py` | 设备/诊断工具注册、输入证据校验及空证据行为 |
-| `docs/milestones/M3.1.md`、`M3.2.md` | 分阶段实现、测试和 HTTP 证据；assets 保存实际模拟响应与演示截图 |
+| `docs/milestones/M3.1.md`、`M3.2.md`、`M4.1.md` | 分阶段实现、测试和 HTTP 证据；M4.1 响应保存在该文档中，旧阶段 assets 保存模拟响应与截图 |
 | `M2_ACCEPTANCE_CHECKLIST.md` | M2 早期只读审查快照，不作为当前测试覆盖状态的唯一依据 |
 | `requirements.txt` | 固定运行与测试的直接依赖版本 |
 | `pyproject.toml` | pytest 目录、导入路径及 marker 配置 |
@@ -123,9 +127,17 @@ Linux/macOS 对应使用 `.venv/bin/python`。默认业务时区为 `Asia/Shangh
 ## 业务调用链
 
 ```text
+应用 lifespan 启动 -> RunService.start() -> 启动单个长期 Worker
+
 POST /runs {message}
   -> FastAPI / CreateRunRequest 校验请求
-  -> RunService 创建 running Run，并保存到内存
+  -> RunService.create_run() 创建 queued Run 并保存到内存字典
+  -> 将 run_id 放入 asyncio.Queue
+  -> 立即返回 queued 深拷贝、run_id、HTTP 202 + Location: /runs/{run_id}
+
+后台 Worker
+  -> queue.get() 取出 run_id
+  -> RunService.execute_run() 将 queued 更新为 running
   -> MockPlanner.plan(message, registry.schemas())
      -> ToolCall：直接调用 ToolRuntime.execute()
      -> ParallelPlan：execute_parallel() 并发调用各工具的 Runtime
@@ -138,14 +150,22 @@ POST /runs {message}
      -> ToolResult 校验并关联 tool_name / tool_call_id
   -> RunService 生成确定性的模拟回答
   -> 保存 succeeded / failed Run
-  -> HTTP 201 + Location: /runs/{run_id}
+  -> finally queue.task_done() -> 继续消费下一个 run_id
 
 GET /runs/{run_id}
   -> 读取已保存记录的深拷贝 -> HTTP 200，不重新执行工具
+
+应用 lifespan 关闭 -> 停止接收提交，取消活动执行并等待清理
+  -> 未执行队列项保存 failed/CANCELLED 并配平 task_done -> Worker 退出
 ```
 
-POST 在请求内等待工具执行完毕，不使用后台任务、Queue 或 Worker。HTTP 201 表示 Run 资源创建成功，
-执行是否成功看 `status`。不支持的自然语言也会保存为失败 Run，便于通过 GET 查看原因。
+POST 不等待 Planner 或工具执行；202 表示已接受提交，响应的状态为 queued，并不表示任务执行成功。
+Worker 在同一进程、同一事件循环中长期运行，Run 之间串行消费，单个 Run 内保留并行工具与 DAG 同批并发。
+不支持的自然语言也先提交为 queued，随后由 Planner 处理并保存为 failed，可通过 GET 查询原因。
+GET 可返回 queued、running、succeeded 或 failed；默认模拟工具很快，首次 GET 可能已经是终态。
+Worker 对单个 Run 的未预期异常保存安全的 INTERNAL_ERROR 后继续消费，不为每个 Run 单独 create_task。
+关闭时尚未执行项保存 failed/CANCELLED，不承诺将所有 queued Run 执行成功；关闭后提交返回 503。
+每次出队均配平 task_done，queue.join 可等待队列排空，但不表示所有 Run 都成功。
 
 Mock Planner 当前支持以下三类明确表达，可省略节点两侧空格：
 
@@ -215,9 +235,11 @@ DAGStep 复用 ToolCall.id 作为步骤 ID。模型拒绝空计划、重复 ID�
 该模型没有强制要求所有工具自行返回的 error 结果都包含 error_code/message；Runtime 生成的错误会提供这两个字段。
 
 HTTP 请求格式非法时返回 422，未知 Run 返回 404。Planner 失败保存为 failed Run。
-协程取消会记录 failed/CANCELLED 并继续向上传播取消信号。
+执行层取消会记录 failed/CANCELLED 并向上传播；Worker 区分单个工具/子任务自行取消与自身被取消：
+前者只结束当前 Run 并继续消费，后者等待清理后退出。
 
-Run 保存 `run_id`、message、状态、创建/完成时间、answer 和顶层 error，执行内容按计划类型区分：
+Run 保存 `run_id`、message、状态、创建/完成时间、answer 和顶层 error。queued 时计划和结果尚未生成，
+completed_at 为 null；Worker 开始后更新 running，终态设置完成时间。已执行内容按计划类型区分：
 
 | 执行路径 | `tool_call` / `result` | `plan` / `tool_executions` |
 | --- | --- | --- |
@@ -225,7 +247,7 @@ Run 保存 `run_id`、message、状态、创建/完成时间、answer 和顶层 
 | ParallelPlan | null / null | 保存并行计划，以及按计划顺序保存的各调用、状态和结果 |
 | DAGPlan | null / null | 保存原始 DAG，以及各步骤的实际调用、依赖、绑定、状态、结果和 error |
 
-DAG 步骤状态包含 pending、running、succeeded、failed、blocked、cancelled；Run 状态仍为 running、succeeded、failed。
+DAG 步骤状态包含 pending、running、succeeded、failed、blocked、cancelled；Run 状态为 queued、running、succeeded、failed。
 ParallelPlan 错误沿用逐工具 `result.metadata` 和顶层 Run.error，执行记录的独立 error 字段默认 null；DAG 路径会填充逐步骤 error。
 多工具失败时保留成功分支；顶层错误按计划顺序选取首个失败，DAG 优先选实际 failed 步骤，其次才是 blocked 步骤。
 
@@ -307,10 +329,12 @@ curl -i -X POST http://127.0.0.1:8000/runs \
 ```
 
 在当前模拟样本中，四步成功时可看到设备 UP、1 条严重告警、流量 72.5% / HIGH 和派生诊断 CRITICAL。
-这些都是模拟结果，不能宣传为真实网络观测或真实故障结论。完整响应参考
-[M3.2 交付时实际保存的 DAG 记录](docs/milestones/assets/m3.2/dag-run.json)，不是本次 README 更新重新请求所得。
+这些都是模拟结果，不能宣传为真实网络观测或真实故障结论。当前异步提交、running 和最终 GET 响应参考
+[M4.1 真实 HTTP 验证记录](docs/milestones/M4.1.md#4-历史真实-tcp--http-验证2026-10-21)，不是本次文档同步重新请求所得。
 
-POST 正常返回 201 及 Location；复制本次返回的 run_id，调用 `GET /runs/{run_id}`，可取回相同的状态、结果和汇总。
+POST 返回 HTTP 202 Accepted、Location，以及包含 run_id 和 `status="queued"` 的 Run 快照；此时 answer、result 尚未生成。
+复制返回的 run_id，通过 `GET /runs/{run_id}` 查询最新状态，直到 succeeded 或 failed，再读取最终结果和汇总。
+POST 的 queued 快照与最终 GET 不相等；二者通过同一 run_id 关联，终态后的重复 GET 保持结果一致。
 在 Git Bash 中把下面变量替换为新建 Run 的实际 ID：
 
 ```bash
@@ -321,7 +345,7 @@ curl "http://127.0.0.1:8000/runs/$run_id"
 独立并发演示使用 `{"message":"综合查询 node_20 昨天的告警和流量"}`；单工具使用
 `{"message":"查询 node_20 昨天的严重告警"}`。三种请求共用 POST/GET 接口。
 
-### 历史 M1 单工具响应（2026-10-12）
+### 单工具 GET 终态示例（沿用 M1 历史模拟结果）
 
 服务启动后，在 Git Bash 中执行：
 
@@ -331,8 +355,9 @@ curl -i -X POST http://127.0.0.1:8000/runs \
   --data '{"message":"查询node_20昨天的严重告警"}'
 ```
 
-下面保留 2026-10-12 本机 HTTP 验证的原始单工具响应。它是 M1 的历史字段结构；
-当前单工具响应另外包含默认 `plan=null`、`tool_executions=[]`。ID 与运行时间每次不同：
+上述 POST 只接受任务并返回 queued；使用其 run_id 查询 GET，等待进入终态后才能读取告警结果。
+下面沿用 2026-10-12 本机 HTTP 验证的历史终态快照说明结果字段，不是当前 POST 的响应。
+当前单工具 GET 另包含默认 `plan=null`、`tool_executions=[]`。ID 与运行时间每次不同：
 
 ```json
 {
@@ -373,14 +398,14 @@ curl -i -X POST http://127.0.0.1:8000/runs \
 }
 ```
 
-用当前服务中新请求返回的 run_id 查询，结果与 POST 一致。下面沿用历史示例 ID 展示路径；
+用当前 POST 返回的 run_id 查询最新状态，执行完成后可读取上述结构的告警结果。下面沿用历史示例 ID 展示路径；
 历史临时服务已关闭，重新启动后应先 POST，再替换为当前有效的 run_id：
 
 ```bash
 curl http://127.0.0.1:8000/runs/3fc746b9-4eb9-4e34-8f42-2ada75019156
 ```
 
-将输入改为“查询 node_404 昨天的严重告警”，会得到 succeeded、success、count=0、
+将输入改为“查询 node_404 昨天的严重告警”，待 Worker 执行后，GET 会得到 succeeded、success、count=0、
 content=[]、indexes=[]。空结果表示查询成功，不会转换成工具失败。
 
 模拟数据为请求起始日生成四条固定样本，分别覆盖节点、告警等级和结束时间边界。
@@ -395,12 +420,31 @@ content=[]、indexes=[]。空结果表示查询成功，不会转换成工具失
 | M0 + M1 代码 | 工程初始化、模拟 Agent 闭环及内存 Run 查询已实现，保留原有行为 |
 | M2 代码 | Tool Runtime 超时、有限重试、显式异常分类已实现；实现提交为 `837c1579c7ef348a004296f199c20171287b493b` |
 | M3.1 代码 | 独立工具并发、逐工具结果保存和汇总已实现；随 `fed1b6a` 提交保留了 M2 的 API 测试及文档 |
-| M3.2 代码 | 静态 DAG 依赖校验、结果绑定、就绪批次调度及失败阻断已实现；当前 main 实现提交为 `0924ce0` |
+| M3.2 代码 | 静态 DAG 依赖校验、结果绑定、就绪批次调度及失败阻断已实现；阶段实现提交为 `0924ce0` |
 | M3.2 自动化测试 | 交付文档记录完整套件 `157 passed in 2.56s`，包括此前 96 项和新增 61 项 |
+| M4.1 代码 | 内存 Queue、单 Worker、202/queued 提交、最新状态 GET 与 lifespan 清理已实现并推送；实现提交为 `4f17ff2` |
+| M4.1 自动化测试 | 历史交付记录 `172 passed in 2.09s`，包括原有 157 项和新增 15 项；本次文档同步未重新运行 |
 | 工程验收边界 | 已有下述自动化和历史 HTTP 证据；不将这些用例扩大为大规模图、任意 handler 或整个项目全部功能的验收通过 |
 
 代码已提交或推送不等于整体验收完成。里程碑文档保留各阶段当时的审查和提交状态，当前代码状态以 main 为准。
 历史 HTTP 检查记录作为已有证据保留，不冒充本次 README 更新新执行的检查。
+
+### M4.1 历史交付记录（2026-10-21）
+
+[M4.1 交付文档](docs/milestones/M4.1.md) 保留当时实际执行的命令和结果：
+
+```text
+.venv/Scripts/python.exe -B -m pytest -q -W error -p no:cacheprovider
+172 passed in 2.09s
+退出码：0
+```
+
+当时新增用例为 `15 passed, 19 deselected in 0.32s`。验证覆盖提交不执行 Planner、POST 在任务结束前返回、
+GET queued/running、FIFO、失败后继续消费、三条执行路径、取消传播与关闭清理；原有测试保留并适配异步提交。
+真实 TCP 验证通过 Event 暂停设备步骤，观察到 202/queued 和 running GET；放行后四步 DAG 成功并保存每步结果，
+BUSINESS_ERROR 后同一 Worker 又完成 DAG、ParallelPlan 和单工具。临时服务已关闭。
+
+**本次 2026-10-22 文档同步没有重新运行测试、启动服务或执行 HTTP 验证；以上均为历史交付证据。**
 
 ### M3.2 交付测试记录（2026-10-20）
 
@@ -462,7 +506,7 @@ No broken requirements found.
 退出码 0
 ```
 
-当时另实际启动了临时 Uvicorn 子进程，通过本机 TCP/HTTP 验证 POST 201、GET 200、空结果成功、
+当时另实际启动了临时 Uvicorn 子进程，通过本机 TCP/HTTP 验证任务提交和查询、空结果成功、
 失败 Run、422、404、`/docs` 和 `/openapi.json`。验证后已关闭该临时服务。
 
 ### 历史 M2 可靠性改造验证
@@ -475,23 +519,25 @@ POST/GET 能保存并查询相同的结果和错误码。该临时服务验证�
 ### 历史 M3.1 / M3.2 HTTP 演示与验证
 
 - [M3.1 交付及 Swagger 演示](docs/milestones/M3.1.md)：初次总结复跑完整套件为 `96 passed in 1.39s`，
-  随后的演示复跑为 `96 passed in 1.36s`；实际验证组合 POST 201、GET 200、响应一致和单工具回归，保存了截图与原始 JSON。
+  随后的演示复跑为 `96 passed in 1.36s`；当时验证组合查询、保存结果和单工具回归，保存了截图与原始 JSON。
 - [M3.2 交付记录](docs/milestones/M3.2.md)：在临时 8001 服务上验证四步 DAG、绑定参数与上游 content 相等、
-  POST 201 / GET 200 完整一致，以及单工具和 ParallelPlan 回归。该临时服务验证后正常关闭，验证期间保留了旧 8000 演示服务。
+  完整结果保存，以及单工具和 ParallelPlan 回归。该临时服务验证后正常关闭，验证期间保留了旧 8000 演示服务。
 
-这些属于历史执行证据。本次没有重跑以上演示；Run 仍只保存于相应服务进程的内存中。
+这些属于旧阶段的历史执行证据，原始材料保存在各阶段文档中；当前统一采用 M4.1 的 202/queued 与 GET 状态查询契约。
+本次没有重跑以上演示；Run 仍只保存于相应服务进程的内存中。
 
 ## Git 与秘密管理
 
-旧 main.py 保存在初始 Git 提交中，新工程没有继续调用旧实现。M0、M1、M2、M3.1、M3.2 代码分阶段维护提交。
+旧 main.py 保存在初始 Git 提交中，新工程没有继续调用旧实现。M0、M1、M2、M3.1、M3.2、M4.1 代码分阶段维护提交。
 `.env`、虚拟环境、缓存和日志均不纳入 Git；只有无秘密的 `.env.example` 会提交。
 推送前检查暂存文件及常见秘密格式。不要将真实网络数据或秘密加入后续提交。
 
 ## 当前限制与后续方向
 
 - 四个工具均为模拟工具；Planner 只识别上述三类规则表达，最终回答由代码确定性汇总，没有真实 LLM。
-- 内存存储只适用于单进程；重启、热重载会丢失 Run，多个进程不共享数据，也没有容量回收。
-- 没有后台 Worker、队列、持久化、Checkpoint、幂等和任务恢复。
+- Queue、Run 字典和 Worker 均在单进程内存中；重启、热重载或进程崩溃会丢失任务，多个进程不共享数据，也没有容量回收。
+- 已有单个后台 Worker 和内存队列；尚无持久化、Claim/Lease、Checkpoint、幂等和崩溃恢复。
+- Run 之间串行消费，无队列容量上限或背压；关闭时取消活动执行并将未执行项记为 failed/CANCELLED。
 - 已有单次异步执行超时与有限重试；尚无重试退避、抖动、整个 Run 的总超时或按工具分别配置的执行策略。
 - 取消依赖 handler 配合，尚无同步阻塞隔离或对任意代码强制终止的能力。
 - 已有独立工具并发和静态 DAG 调度；尚无并发数量上限，大规模 DAG 性能未经验证，也没有条件/可选步骤或动态增图。
@@ -501,9 +547,9 @@ POST/GET 能保存并查询相同的结果和错误码。该临时服务验证�
 - 没有 SSE、结构化 Trace、RAG、Elasticsearch、Rerank、Redis、PostgreSQL、Docker 或 CI。
 - 没有用户认证和生产部署配置。
 
-后续可单独规划并发上限、大规模图和取消边界验证，再按阶段扩展重试退避、幂等、Trace、
-真实 LLM 或持久化等能力。已有的 Timeout/Retry、ParallelPlan 和静态 DAG 调度不再列为待开发功能。
-本次只更新 README，不扩展功能，不提交或推送 Git。
+后续可规划 Run 持久化、原子 Claim 与 Lease 续期/回收、幂等和崩溃恢复，再按阶段扩展并发上限、
+大规模图与取消边界验证、重试退避、Trace 或真实 LLM。已有的 Timeout/Retry、ParallelPlan、静态 DAG 和内存 Queue/Worker 不再列为待开发功能。
+本次仅同步 README 与 M4.1 交付文档，不扩展功能、不重新运行测试。
 
 ## 公开技术参考
 
