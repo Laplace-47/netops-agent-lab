@@ -79,18 +79,27 @@ async def client(planner, client_factory):
 
 
 @pytest.fixture
-def run_to_completion():
+async def run_to_completion():
+    services = set()
+
     async def execute(service, message):
         # 执行层单元测试独立驱动一次出队，便于直接验证 CancelledError 传播。
         # 真正的长期 Worker 和生命周期另有 API 集成测试覆盖。
+        services.add(service)
         submitted = await service.create_run(message)
         run_id = service.queue.get_nowait()
         assert run_id == submitted.run_id
         try:
             return await service.execute_run(run_id)
         finally:
+            service._enqueued_ids.discard(run_id)
             service.queue.task_done()
-    return execute
+    try:
+        yield execute
+    finally:
+        for service in services:
+            await service.stop()
+            service.repository.close()
 
 
 @pytest.fixture

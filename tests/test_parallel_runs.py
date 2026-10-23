@@ -271,7 +271,8 @@ async def test_parallel_cancellation_propagates_and_cleans_children(
     task = asyncio.create_task(run_to_completion(service, COMBINED_MESSAGE))
     try:
         await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started.values())), timeout=1)
-        run_id, = service._runs
+        running_record, = service.repository.list_by_status("running")
+        run_id = running_record.run_id
         running = service.get_run(run_id)
         assert [r.status for r in running.tool_executions] == ["running", "running"]
         if cancel_source == "external":

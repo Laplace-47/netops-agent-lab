@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import Callable
 
 from netops_agent.models import ToolExecution, ToolResult
 from netops_agent.runtime import ToolRuntime
@@ -9,9 +10,13 @@ from netops_agent.runtime import ToolRuntime
 logger = logging.getLogger(__name__)
 
 
-async def execute_parallel(runtime: ToolRuntime, executions: list[ToolExecution]) -> None:
+async def execute_parallel(
+    runtime: ToolRuntime, executions: list[ToolExecution], *, on_change: Callable[[], None] | None = None,
+) -> None:
     async def execute_one(entry: ToolExecution) -> None:
         entry.status = "running"
+        if on_change is not None:
+            on_change()
         try:
             entry.result = await runtime.execute(entry.tool_call)
         except asyncio.CancelledError:
@@ -29,12 +34,14 @@ async def execute_parallel(runtime: ToolRuntime, executions: list[ToolExecution]
                 content=[], indexes=[],
             )
         entry.status = "succeeded" if entry.result.type == "success" else "failed"
+        if on_change is not None:
+            on_change()
 
     tasks = [asyncio.create_task(execute_one(entry)) for entry in executions]
     try:
         await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        # gather 的某个子任务取消时，不会自动取消其余子任务，必须显式清理。
+    except (asyncio.CancelledError, Exception):
+        # 子任务取消或状态保存失败时，显式清理其他分支后继续传播异常。
         for task in tasks:
             if not task.done():
                 task.cancel()

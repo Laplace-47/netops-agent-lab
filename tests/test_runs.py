@@ -238,8 +238,9 @@ async def test_cancelled_run_is_saved_and_retrievable(app_with_handler, run_to_c
         task = asyncio.create_task(run_to_completion(service, "查询node_20昨天的严重告警"))
         try:
             await asyncio.wait_for(started.wait(), timeout=1)
-            # 当前没有列出 Run 的接口，仅从内存获取新任务 ID；状态使用公开查询验证。
-            run_id, = service._runs
+            # Repository 是权威存储，借助状态查询观测本次运行 ID。
+            running_record, = service.repository.list_by_status("running")
+            run_id = running_record.run_id
             running = service.get_run(run_id)
             assert running.status == "running"
             assert running.completed_at is None
@@ -346,6 +347,7 @@ async def test_submission_does_not_call_planner_and_returns_independent_queued_s
         assert service.get_run(submitted.run_id).status == "succeeded"
     finally:
         await service.stop()
+        service.repository.close()
 
 
 async def test_worker_contains_unexpected_run_exception_and_keeps_consuming(monkeypatch, planner):
@@ -421,7 +423,7 @@ async def test_single_worker_preserves_fifo_and_get_does_not_execute(monkeypatch
     "查询 node_20 昨天的严重告警", "综合查询 node_20 昨天的告警和流量",
     "诊断 node_20 昨天的设备状态、告警和流量",
 ])
-async def test_lifespan_shutdown_cleans_active_and_queued_runs(monkeypatch, planner, message):
+async def test_lifespan_shutdown_cleans_active_and_queued_runs(monkeypatch, planner, tmp_path, message):
     started, cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
     calls = 0
     lock = asyncio.Lock()
@@ -438,7 +440,7 @@ async def test_lifespan_shutdown_cleans_active_and_queued_runs(monkeypatch, plan
                 await release_cleanup.wait()
 
     monkeypatch.setattr("main.find_warning", handler)
-    app = create_app(planner)
+    app = create_app(planner, db_path=tmp_path / "shutdown.sqlite")
     service = app.state.run_service
     lifetime = app.router.lifespan_context(app)
     await lifetime.__aenter__()
@@ -454,11 +456,15 @@ async def test_lifespan_shutdown_cleans_active_and_queued_runs(monkeypatch, plan
             release_cleanup.set()
             await asyncio.wait_for(shutdown, timeout=1)
             await asyncio.wait_for(service.queue.join(), timeout=1)
-            for response in (active, queued):
-                run = (await client.get(response.headers["location"])).json()
-                assert run["status"] == "failed" and run["error"]["code"] == "CANCELLED"
-                assert run["completed_at"] is not None
+            assert service.repository._connection is None
+            # 仅重开连接观测关闭后的文件，不重启 Worker 或恢复队列。
+            service.repository.initialize()
+            run = (await client.get(active.headers["location"])).json()
+            assert run["status"] == "failed" and run["error"]["code"] == "CANCELLED"
+            assert run["completed_at"] is not None
             queued_run = (await client.get(queued.headers["location"])).json()
+            assert queued_run["status"] == "queued" and queued_run["error"] is None
+            assert queued_run["completed_at"] is None
             assert queued_run["plan"] is None and queued_run["tool_call"] is None
             assert calls == 1 and not lock.locked() and worker.done()
             assert service.queue.empty()
@@ -466,6 +472,7 @@ async def test_lifespan_shutdown_cleans_active_and_queued_runs(monkeypatch, plan
         finally:
             release_cleanup.set()
             await asyncio.gather(shutdown, return_exceptions=True)
+            service.repository.close()
 
 
 @pytest.mark.parametrize("wait_for_get", [False, True])
@@ -520,7 +527,7 @@ async def test_child_cancellation_fails_only_current_run_and_worker_continues(
         assert calls == 2 and app.state.run_service._worker_task is worker
 
 
-async def test_cancelling_shutdown_waits_for_cleanup_then_propagates(monkeypatch, planner):
+async def test_cancelling_shutdown_waits_for_cleanup_then_propagates(monkeypatch, planner, tmp_path):
     started, cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
     cleaned = asyncio.Event()
 
@@ -534,7 +541,7 @@ async def test_cancelling_shutdown_waits_for_cleanup_then_propagates(monkeypatch
             cleaned.set()
 
     monkeypatch.setattr("main.find_warning", handler)
-    app = create_app(planner)
+    app = create_app(planner, db_path=tmp_path / "cancel-shutdown.sqlite")
     service = app.state.run_service
     lifetime = app.router.lifespan_context(app)
     await lifetime.__aenter__()
@@ -554,22 +561,33 @@ async def test_cancelling_shutdown_waits_for_cleanup_then_propagates(monkeypatch
             await asyncio.wait_for(shutdown, timeout=1)
         assert cleaned.is_set() and service._worker_task.done()
         await asyncio.wait_for(service.queue.join(), timeout=1)
-        for submitted in (active, queued):
-            saved = service.get_run(submitted.run_id)
-            assert saved.status == "failed" and saved.error.code == "CANCELLED"
-            assert saved.completed_at is not None
+        assert service.repository._connection is None
+        service.repository.initialize()
+        saved = service.get_run(active.run_id)
+        assert saved.status == "failed" and saved.error.code == "CANCELLED"
+        assert saved.completed_at is not None
+        queued_saved = service.get_run(queued.run_id)
+        assert queued_saved.status == "queued" and queued_saved.error is None
+        assert queued_saved.completed_at is None
     finally:
         release_cleanup.set()
         await asyncio.gather(shutdown, return_exceptions=True)
+        service.repository.close()
 
 
-async def test_shutdown_rejects_new_submissions_without_creating_run(planner):
-    app = create_app(planner)
+async def test_shutdown_rejects_new_submissions_without_creating_run(planner, tmp_path):
+    app = create_app(planner, db_path=tmp_path / "reject.sqlite")
     service = app.state.run_service
     async with app.router.lifespan_context(app):
         pass
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/runs", json={"message": "查询 node_20 昨天的严重告警"})
         assert response.status_code == 503
-        assert service._runs == {} and service.queue.empty()
+        service.repository.initialize()
+        try:
+            assert all(service.repository.list_by_status(status) == []
+                       for status in ("queued", "running", "succeeded", "failed"))
+            assert service.queue.empty()
+        finally:
+            service.repository.close()
     await asyncio.wait_for(service.queue.join(), timeout=1)

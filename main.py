@@ -2,6 +2,7 @@
 
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Response
@@ -10,6 +11,7 @@ from netops_agent.models import CreateRunRequest, RunRecord
 from netops_agent.planner import MockPlanner, Planner
 from netops_agent.registry import ToolDefinition, ToolRegistry
 from netops_agent.runtime import ToolRuntime
+from netops_agent.repository import SQLiteRunRepository
 from netops_agent.service import RunService
 from netops_agent.tools import (
     DiagnoseNodeArgs, FindWarningArgs, GetDeviceArgs, GetTrafficArgs,
@@ -17,7 +19,7 @@ from netops_agent.tools import (
 )
 
 
-def create_app(planner: Planner | None = None) -> FastAPI:
+def create_app(planner: Planner | None = None, *, db_path: str | Path = ":memory:") -> FastAPI:
     registry = ToolRegistry()
     registry.register(ToolDefinition(
         name="find_warning",
@@ -40,15 +42,20 @@ def create_app(planner: Planner | None = None) -> FastAPI:
         args_model=DiagnoseNodeArgs, handler=diagnose_node,
     ))
     planner = planner or MockPlanner(timezone_name=os.getenv("NETOPS_TIMEZONE", "Asia/Shanghai"))
-    service = RunService(planner, ToolRuntime(registry))
+    repository = SQLiteRunRepository(db_path)
+    service = RunService(planner, ToolRuntime(registry), repository)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await service.start()
         try:
+            repository.initialize()
+            await service.start()
             yield
         finally:
-            await service.stop()
+            try:
+                await service.stop()
+            finally:
+                repository.close()
 
     app = FastAPI(title="NetOps Agent Lab", version="0.1.0", lifespan=lifespan)
     app.state.run_service = service
@@ -72,4 +79,4 @@ def create_app(planner: Planner | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+app = create_app(db_path=os.getenv("NETOPS_DB_PATH", "data/netops_agent.db"))

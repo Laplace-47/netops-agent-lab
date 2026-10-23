@@ -2,13 +2,16 @@
 
 import asyncio
 from copy import deepcopy
+from collections.abc import Callable
 
 from netops_agent.models import RunError, ToolExecution
 from netops_agent.orchestration import execute_parallel
 from netops_agent.runtime import ToolRuntime
 
 
-async def execute_dag(runtime: ToolRuntime, executions: list[ToolExecution]) -> None:
+async def execute_dag(
+    runtime: ToolRuntime, executions: list[ToolExecution], *, on_change: Callable[[], None] | None = None,
+) -> None:
     """输入由 RunService 从通过 DAGPlan 校验的计划初始化；原地保存执行状态。"""
     by_id = {entry.tool_call.id: entry for entry in executions}
     try:
@@ -39,7 +42,7 @@ async def execute_dag(runtime: ToolRuntime, executions: list[ToolExecution]) -> 
                         raise RuntimeError("绑定来源没有成功结果")
                     arguments[binding.target_argument] = deepcopy(source.result.content)
                 entry.tool_call = entry.tool_call.model_copy(update={"arguments": arguments}, deep=True)
-            await execute_parallel(runtime, ready)
+            await execute_parallel(runtime, ready, on_change=on_change)
     except asyncio.CancelledError:
         # execute_parallel 已取消并等待本批子任务，尚未调度的步骤也保存取消状态。
         for entry in executions:

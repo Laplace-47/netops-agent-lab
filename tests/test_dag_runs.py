@@ -454,7 +454,8 @@ async def test_dag_cancel_propagates_waits_for_cleanup_and_saves_future_steps(
     task = asyncio.create_task(run_to_completion(service, "模拟取消 DAG"))
     try:
         await asyncio.wait_for(asyncio.gather(*(started[name].wait() for name in active)), timeout=1)
-        run_id, = service._runs
+        running_record, = service.repository.list_by_status("running")
+        run_id = running_record.run_id
         if cancel_source == "external":
             task.cancel()
         else:

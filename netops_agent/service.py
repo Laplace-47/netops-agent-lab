@@ -1,4 +1,4 @@
-"""内存队列提交、单 Worker 执行及可查询的 Run 快照。"""
+"""持久化 Run、内存队列及单 Worker；仅恢复 queued，不回收 running。"""
 
 import asyncio
 import logging
@@ -9,17 +9,19 @@ from netops_agent.dag import execute_dag
 from netops_agent.models import DAGPlan, ParallelPlan, RunError, RunRecord, ToolCall, ToolExecution
 from netops_agent.orchestration import execute_parallel
 from netops_agent.planner import Planner, UnsupportedRequest
+from netops_agent.repository import RunRepository, SQLiteRunRepository
 from netops_agent.runtime import ToolRuntime
 
 logger = logging.getLogger(__name__)
 
 
 class RunService:
-    def __init__(self, planner: Planner, runtime: ToolRuntime):
+    def __init__(self, planner: Planner, runtime: ToolRuntime, repository: RunRepository | None = None):
         self.planner = planner
         self.runtime = runtime
-        self._runs: dict[UUID, RunRecord] = {}
+        self.repository = repository if repository is not None else SQLiteRunRepository()
         self.queue: asyncio.Queue[UUID] = asyncio.Queue()
+        self._enqueued_ids: set[UUID] = set()
         self._worker_task: asyncio.Task | None = None
         self._closing = False
 
@@ -28,19 +30,28 @@ class RunService:
         if self._closing:
             raise RuntimeError("RunService 正在关闭，不能提交任务。")
         run = RunRecord(message=message)
-        self._runs[run.run_id] = run
+        self.repository.save(run)
         # 无界内存队列的入队不让出控制权，返回的快照始终为 queued。
-        self.queue.put_nowait(run.run_id)
+        self._enqueue(run.run_id)
         return run.model_copy(deep=True)
+
+    def _enqueue(self, run_id: UUID) -> None:
+        # 仅做本实例队列去重，不是跨进程 Claim 或幂等保证。
+        if run_id not in self._enqueued_ids:
+            self.queue.put_nowait(run_id)
+            self._enqueued_ids.add(run_id)
 
     async def start(self) -> None:
         if self._worker_task is not None and not self._worker_task.done():
             return
+        self.repository.initialize()
+        for run in self.repository.list_by_status("queued"):
+            self._enqueue(run.run_id)
         self._closing = False
         self._worker_task = asyncio.create_task(self._work(), name="netops-run-worker")
 
     async def stop(self) -> None:
-        """停止接收任务，取消当前执行并等待清理；排空尚未执行的任务。"""
+        """取消活动执行并等待清理；清空内存队列，数据库 queued 留待下次启动。"""
         worker = self._worker_task
         if not self._closing and worker is not None and not worker.done():
             worker.cancel()
@@ -58,12 +69,8 @@ class RunService:
         finally:
             while not self.queue.empty():
                 run_id = self.queue.get_nowait()
-                try:
-                    run = self._runs[run_id]
-                    if run.status == "queued":
-                        self._fail_run(run, "CANCELLED", "服务关闭，任务尚未执行。")
-                finally:
-                    self.queue.task_done()
+                self._enqueued_ids.discard(run_id)
+                self.queue.task_done()
 
     async def _work(self) -> None:
         while True:
@@ -71,33 +78,37 @@ class RunService:
             try:
                 await self.execute_run(run_id)
             except asyncio.CancelledError:
-                run = self._runs.get(run_id)
-                if run is not None:
-                    self._fail_run(run, "CANCELLED", "任务执行已取消。")
+                self._record_failure(run_id, "CANCELLED", "任务执行已取消。")
                 if asyncio.current_task().cancelling():
                     raise
                 # handler/编排子任务自行取消只结束当前 Run，消费者继续服务。
             except Exception:
                 logger.exception("Worker 处理 Run %s 失败", run_id)
-                run = self._runs.get(run_id)
-                if run is not None:
-                    self._fail_run(run, "INTERNAL_ERROR", "任务执行发生异常。")
+                self._record_failure(run_id, "INTERNAL_ERROR", "任务执行发生异常。")
             finally:
+                self._enqueued_ids.discard(run_id)
                 self.queue.task_done()
 
-    @staticmethod
-    def _fail_run(run: RunRecord, code: str, message: str) -> None:
-        run.status = "failed"
-        run.error = RunError(code=code, message=message)
-        run.answer = None
-        run.completed_at = datetime.now(timezone.utc)
+    def _record_failure(self, run_id: UUID, code: str, message: str) -> None:
+        try:
+            run = self.repository.get(run_id)
+            run.status = "failed"
+            run.error = RunError(code=code, message=message)
+            run.answer = None
+            run.completed_at = datetime.now(timezone.utc)
+            self.repository.save(run)
+        except Exception:
+            # 存储自身故障可能无法记录终态；记录日志，避免永久失去消费者。
+            logger.exception("无法保存 Run %s 的失败状态", run_id)
 
     async def execute_run(self, run_id: UUID) -> RunRecord:
         """由 Worker 调用；复用已有的单工具、ParallelPlan 和 DAG 执行链。"""
-        run = self._runs[run_id]
+        run = self.repository.get(run_id)
         if run.status != "queued":
             return run.model_copy(deep=True)
         run.status = "running"
+        self.repository.save(run)
+        cancelled = False
         try:
             call = await self.planner.plan(run.message, self.runtime.registry.schemas())
             if isinstance(call, DAGPlan):
@@ -106,6 +117,7 @@ class RunService:
                 await self._execute_parallel(run, call)
             else:
                 run.tool_call = ToolCall.model_validate(call)
+                self.repository.save(run)
                 run.result = await self.runtime.execute(run.tool_call)
                 if run.result.type == "success":
                     run.status = "succeeded"
@@ -124,6 +136,7 @@ class RunService:
             run.status = "failed"
             run.error = RunError(code="UNSUPPORTED_REQUEST", message=str(exc))
         except asyncio.CancelledError:
+            cancelled = True
             run.status = "failed"
             run.error = RunError(code="CANCELLED", message="任务执行已取消。")
             raise
@@ -133,12 +146,20 @@ class RunService:
             run.error = RunError(code="INTERNAL_ERROR", message="任务执行发生异常。")
         finally:
             run.completed_at = datetime.now(timezone.utc)
+            try:
+                self.repository.save(run)
+            except Exception:
+                if not cancelled:
+                    raise
+                # 保存失败不得覆盖原取消；Worker 仍会尝试兜底保存并按取消来源退出或继续。
+                logger.exception("Run %s 取消状态保存失败，继续传播取消。", run.run_id)
         return run.model_copy(deep=True)
 
     async def _execute_parallel(self, run: RunRecord, plan: ParallelPlan) -> None:
         run.plan = ParallelPlan.model_validate(plan)
         run.tool_executions = [ToolExecution(tool_call=call) for call in run.plan.tool_calls]
-        await execute_parallel(self.runtime, run.tool_executions)
+        self.repository.save(run)
+        await execute_parallel(self.runtime, run.tool_executions, on_change=lambda: self.repository.save(run))
         failures = [entry for entry in run.tool_executions if entry.status == "failed"]
         run.status = "failed" if failures else "succeeded"
         if failures:
@@ -156,7 +177,8 @@ class RunService:
         run.tool_executions = [ToolExecution(
             tool_call=step.tool_call, depends_on=step.depends_on, bindings=step.bindings,
         ) for step in run.plan.steps]
-        await execute_dag(self.runtime, run.tool_executions)
+        self.repository.save(run)
+        await execute_dag(self.runtime, run.tool_executions, on_change=lambda: self.repository.save(run))
         failed = [entry for entry in run.tool_executions if entry.status == "failed"]
         blocked = [entry for entry in run.tool_executions if entry.status == "blocked"]
         run.status = "failed" if failed or blocked else "succeeded"
@@ -200,4 +222,4 @@ class RunService:
         return "【模拟结果】" + "；".join(parts) + "。"
 
     def get_run(self, run_id: UUID) -> RunRecord:
-        return self._runs[run_id].model_copy(deep=True)
+        return self.repository.get(run_id).model_copy(deep=True)
