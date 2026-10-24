@@ -5,7 +5,7 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
-from contextlib import closing
+from contextlib import AsyncExitStack, closing
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -297,7 +297,7 @@ async def test_worker_outer_failure_is_persisted_and_next_run_executes(
     path = tmp_path / "outer.sqlite"
     app = create_app(planner, db_path=path)
     service = app.state.run_service
-    execute, save = service.execute_run, service.repository.save
+    execute, claim = service.execute_run, service.repository.claim
     triggered = False
 
     async def fail_execution(run_id):
@@ -309,15 +309,15 @@ async def test_worker_outer_failure_is_persisted_and_next_run_executes(
             raise RuntimeError("DO_NOT_EXPOSE_INTERNAL_DETAILS")
         return await execute(run_id)
 
-    def fail_running(run):
+    def fail_claim(run_id):
         nonlocal triggered
-        if not triggered and run.status == "running":
+        if not triggered:
             triggered = True
             raise sqlite3.OperationalError("DO_NOT_EXPOSE_INTERNAL_DETAILS")
-        save(run)
+        return claim(run_id)
 
     if failure == "before_running":
-        monkeypatch.setattr(service.repository, "save", fail_running)
+        monkeypatch.setattr(service.repository, "claim", fail_claim)
     else:
         monkeypatch.setattr(service, "execute_run", fail_execution)
     async with client_factory(app) as client:
@@ -575,3 +575,169 @@ async def test_terminal_save_failure_without_cancellation_is_not_suppressed(
         assert saved["completed_at"] is not None and failures == 1
         response = await client.post("/runs", json={"message": MESSAGES[0]})
         assert (await client.completed_run(response))["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("message, execution_count", [(MESSAGES[0], 1), (MESSAGES[1], 2), (MESSAGES[2], 4)])
+async def test_two_services_recover_same_run_but_only_claim_winner_executes(
+    tmp_path, planner, monkeypatch, client_factory, message, execution_count,
+):
+    path = tmp_path / "shared-claim.sqlite"
+    run = RunRecord(message=message)
+    publisher = SQLiteRunRepository(path)
+    try:
+        publisher.save(run)
+    finally:
+        publisher.close()
+    permit_claims, planner_started, permit_planner = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    restored = {label: asyncio.Event() for label in ("first", "second")}
+    planner_calls, runtime_calls, handler_calls = Counter(), Counter(), Counter()
+    claim_outcomes = {label: [] for label in restored}
+
+    class PausedPlanner:
+        def __init__(self, label):
+            self.label = label
+
+        async def plan(self, message, tools):
+            planner_calls[self.label] += 1
+            planner_started.set()
+            await permit_planner.wait()
+            return await planner.plan(message, tools)
+
+    def build(label):
+        async def handler(args):
+            handler_calls[label] += 1
+            return await find_warning(args)
+
+        monkeypatch.setattr("main.find_warning", handler)
+        app = create_app(PausedPlanner(label), db_path=path)
+        service = app.state.run_service
+        claim, execute_run, execute_tool = service.repository.claim, service.execute_run, service.runtime.execute
+
+        def observed_claim(run_id):
+            claimed = claim(run_id)
+            claim_outcomes[label].append(claimed is not None)
+            return claimed
+
+        async def gated_execution(run_id):
+            assert run_id == run.run_id
+            restored[label].set()
+            await permit_claims.wait()
+            return await execute_run(run_id)
+
+        async def observed_runtime(call):
+            runtime_calls[label] += 1
+            return await execute_tool(call)
+
+        monkeypatch.setattr(service.repository, "claim", observed_claim)
+        monkeypatch.setattr(service, "execute_run", gated_execution)
+        monkeypatch.setattr(service.runtime, "execute", observed_runtime)
+        return app
+
+    apps = {label: build(label) for label in restored}
+    services = {label: app.state.run_service for label, app in apps.items()}
+    async with AsyncExitStack() as stack:
+        clients = {label: await stack.enter_async_context(client_factory(app)) for label, app in apps.items()}
+        try:
+            # 两个 Worker 都从启动恢复队列取得同一个 ID，再一起放行 Claim。
+            await asyncio.wait_for(asyncio.gather(*(event.wait() for event in restored.values())), timeout=2)
+            assert all(service._enqueued_ids == {run.run_id} for service in services.values())
+            assert services["first"].get_run(run.run_id).status == "queued"
+            permit_claims.set()
+            await asyncio.wait_for(planner_started.wait(), timeout=1)
+            assert sum(planner_calls.values()) == 1
+            winner = next(iter(planner_calls))
+            loser = next(label for label in services if label != winner)
+            losing_service = services[loser]
+            await asyncio.wait_for(losing_service.queue.join(), timeout=1)
+            assert claim_outcomes == {winner: [True], loser: [False]}
+            assert losing_service._enqueued_ids == set() and not losing_service._worker_task.done()
+            assert runtime_calls == handler_calls == {}
+            for client in clients.values():
+                running = await client.get(f"/runs/{run.run_id}")
+                assert running.status_code == 200 and running.json()["status"] == "running"
+
+            # 模拟再次收到遗留队列项：running 不能重领，不能改变原任务状态。
+            losing_service._enqueue(run.run_id)
+            await asyncio.wait_for(losing_service.queue.join(), timeout=1)
+            assert claim_outcomes[loser] == [False, False]
+            assert losing_service.get_run(run.run_id).status == "running"
+            assert sum(planner_calls.values()) == 1 and runtime_calls == handler_calls == {}
+
+            permit_planner.set()
+            await asyncio.wait_for(asyncio.gather(*(service.queue.join() for service in services.values())), timeout=2)
+            responses = [await client.get(f"/runs/{run.run_id}") for client in clients.values()]
+            assert all(response.status_code == 200 for response in responses)
+            saved = responses[0].json()
+            assert responses[1].json() == saved
+            assert saved["status"] == "succeeded" and saved["completed_at"] is not None
+            assert saved["error"] is None and saved["answer"].startswith("【模拟结果】")
+            if execution_count == 1:
+                assert saved["result"]["type"] == "success"
+            else:
+                assert len(saved["tool_executions"]) == execution_count
+                assert all(entry["status"] == "succeeded" and entry["result"]["type"] == "success"
+                           for entry in saved["tool_executions"])
+
+            # succeeded 的遗留队列项同样不执行，完整结果不得被覆盖。
+            losing_service._enqueue(run.run_id)
+            await asyncio.wait_for(losing_service.queue.join(), timeout=1)
+            assert claim_outcomes == {winner: [True], loser: [False, False, False]}
+            assert planner_calls == {winner: 1} and handler_calls == {winner: 1}
+            assert runtime_calls == {winner: execution_count}
+            assert all(service.get_run(run.run_id).model_dump(mode="json") == saved for service in services.values())
+            with closing(sqlite3.connect(path)) as observer:
+                rows = observer.execute("SELECT status, record_json FROM runs").fetchall()
+                assert len(rows) == 1 and rows[0][0] == "succeeded"
+                assert RunRecord.model_validate_json(rows[0][1]).model_dump(mode="json") == saved
+            assert all(service._enqueued_ids == set() for service in services.values())
+        finally:
+            permit_claims.set()
+            permit_planner.set()
+    for service in services.values():
+        assert service._worker_task.done() and service.repository._connection is None
+        assert service.queue.empty() and service._enqueued_ids == set()
+        await asyncio.wait_for(service.queue.join(), timeout=1)
+
+
+@pytest.mark.parametrize("status", ["running", "succeeded", "failed", None])
+async def test_execute_run_without_claim_returns_snapshot_or_missing_without_execution(
+    tmp_path, monkeypatch, client_factory, status,
+):
+    calls = Counter()
+
+    class ForbiddenPlanner:
+        async def plan(self, message, tools):
+            calls["planner"] += 1
+            raise AssertionError("未领取的任务不得执行 Planner")
+
+    async def forbidden_runtime(call):
+        calls["runtime"] += 1
+        raise AssertionError("未领取的任务不得执行 Runtime 或 handler")
+
+    app = create_app(ForbiddenPlanner(), db_path=tmp_path / "not-claimed.sqlite")
+    service = app.state.run_service
+    monkeypatch.setattr(service.runtime, "execute", forbidden_runtime)
+    claim = service.repository.claim
+
+    def observed_claim(run_id):
+        calls["claim"] += 1
+        return claim(run_id)
+
+    monkeypatch.setattr(service.repository, "claim", observed_claim)
+    run = RunRecord(message="模拟不可领取", status=status or "queued", answer="保留模拟结果")
+    if status in ("succeeded", "failed"):
+        run.completed_at = run.created_at
+    async with client_factory(app) as client:
+        if status is None:
+            with pytest.raises(KeyError):
+                await service.execute_run(run.run_id)
+            assert (await client.get(f"/runs/{run.run_id}")).status_code == 404
+        else:
+            service.repository.save(run)
+            snapshot = await service.execute_run(run.run_id)
+            assert snapshot == run
+            snapshot.answer = "修改快照不得写回数据库"
+            assert service.get_run(run.run_id) == run
+        assert calls == {"claim": 1}
+        assert service._enqueued_ids == set()
+        await asyncio.wait_for(service.queue.join(), timeout=1)

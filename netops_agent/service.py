@@ -103,11 +103,9 @@ class RunService:
 
     async def execute_run(self, run_id: UUID) -> RunRecord:
         """由 Worker 调用；复用已有的单工具、ParallelPlan 和 DAG 执行链。"""
-        run = self.repository.get(run_id)
-        if run.status != "queued":
-            return run.model_copy(deep=True)
-        run.status = "running"
-        self.repository.save(run)
+        run = self.repository.claim(run_id)
+        if run is None:
+            return self.get_run(run_id)
         cancelled = False
         try:
             call = await self.planner.plan(run.message, self.runtime.registry.schemas())

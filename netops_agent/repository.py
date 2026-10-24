@@ -12,6 +12,7 @@ from netops_agent.models import RunRecord
 class RunRepository(Protocol):
     def initialize(self) -> None: ...
     def save(self, run: RunRecord) -> None: ...
+    def claim(self, run_id: UUID) -> RunRecord | None: ...
     def get(self, run_id: UUID) -> RunRecord: ...
     def list_by_status(self, status: str) -> list[RunRecord]: ...
     def close(self) -> None: ...
@@ -74,6 +75,30 @@ class SQLiteRunRepository:
                     completed_at=excluded.completed_at, record_json=excluded.record_json
             """, (str(run.run_id), run.status, run.created_at.astimezone(timezone.utc).isoformat(),
                   run.completed_at.isoformat() if run.completed_at is not None else None, record_json))
+
+    def claim(self, run_id: UUID) -> RunRecord | None:
+        """在短写事务内领取 queued；事务提交后才返回，不提供 Lease 或崩溃回收。"""
+        connection = self._get_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, record_json FROM runs WHERE run_id = ?", (str(run_id),),
+            ).fetchone()
+            if row is None or row[0] != "queued":
+                connection.rollback()
+                return None
+            run = RunRecord.model_validate_json(row[1])
+            run.status = "running"
+            run.completed_at = None
+            updated = connection.execute("""
+                UPDATE runs SET status = 'running', completed_at = ?, record_json = ?
+                WHERE run_id = ? AND status = 'queued'
+            """, (None, run.model_dump_json(), str(run_id)))
+            if updated.rowcount != 1:
+                connection.rollback()
+                return None
+        # 连接上下文提交或在异常时回滚；Planner/工具不会在事务中执行。
+        return run
 
     def get(self, run_id: UUID) -> RunRecord:
         row = self._get_connection().execute(
