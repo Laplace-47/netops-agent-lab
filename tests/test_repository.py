@@ -148,19 +148,19 @@ def test_claim_preserves_complete_record_and_commits_columns_and_json(repository
     repository.save(run)
     expected = run.model_dump(mode="json")
     expected["status"] = "running"
-    claimed = repository.claim(run.run_id)
-    assert claimed is not None and claimed.model_dump(mode="json") == expected
-    assert claimed.completed_at is None and run.status == "queued"
+    claimed = repository.claim(run.run_id, "test-owner", 30)
+    assert claimed is not None and claimed.run.model_dump(mode="json") == expected
+    assert claimed.run.completed_at is None and run.status == "queued"
     assert not repository._connection.in_transaction
     with closing(sqlite3.connect(repository.db_path)) as observer:
         before_second_claim = observer.execute("SELECT * FROM runs WHERE run_id=?", (str(run.run_id),)).fetchone()
         assert before_second_claim[1] == "running" and before_second_claim[3] is None
         assert datetime.fromisoformat(before_second_claim[2]) == run.created_at
         assert RunRecord.model_validate_json(before_second_claim[4]).model_dump(mode="json") == expected
-        assert repository.claim(run.run_id) is None
+        assert repository.claim(run.run_id, "other-owner", 30) is None
         assert observer.execute("SELECT * FROM runs WHERE run_id=?", (str(run.run_id),)).fetchone() == before_second_claim
     assert not repository._connection.in_transaction
-    claimed.result.content.clear()
+    claimed.run.result.content.clear()
     assert repository.get(run.run_id).model_dump(mode="json") == expected
 
 
@@ -171,9 +171,9 @@ def test_claim_nonqueued_and_missing_runs_do_not_change_records(repository, stat
     repository.save(run)
     with closing(sqlite3.connect(repository.db_path)) as observer:
         before = observer.execute("SELECT * FROM runs").fetchall()
-        assert repository.claim(run.run_id) is None
+        assert repository.claim(run.run_id, "test-owner", 30) is None
         assert not repository._connection.in_transaction
-        assert repository.claim(uuid4()) is None
+        assert repository.claim(uuid4(), "test-owner", 30) is None
         assert not repository._connection.in_transaction
         assert observer.execute("SELECT * FROM runs").fetchall() == before
     assert repository.get(run.run_id) == run
@@ -188,7 +188,7 @@ def test_claim_rolls_back_sql_failure_and_allows_subsequent_operations(repositor
         BEGIN SELECT RAISE(ABORT, 'claim rejected'); END
     """)
     with pytest.raises(sqlite3.IntegrityError, match="claim rejected"):
-        repository.claim(run.run_id)
+        repository.claim(run.run_id, "test-owner", 30)
     assert not connection.in_transaction and repository.get(run.run_id) == run
     observer = SQLiteRunRepository(repository.db_path)
     try:
@@ -196,10 +196,10 @@ def test_claim_rolls_back_sql_failure_and_allows_subsequent_operations(repositor
     finally:
         observer.close()
     connection.execute("DROP TRIGGER reject_claim")
-    claimed = repository.claim(run.run_id)
-    assert claimed is not None and claimed.status == "running"
-    claimed.status = "succeeded"
-    repository.save(claimed)
+    claimed = repository.claim(run.run_id, "test-owner", 30)
+    assert claimed is not None and claimed.run.status == "running"
+    claimed.run.status = "succeeded"
+    repository.save(claimed.run)
     assert repository.get(run.run_id).status == "succeeded" and not connection.in_transaction
 
 
@@ -210,7 +210,7 @@ def test_claim_rolls_back_invalid_json_and_releases_write_lock(repository):
     with connection:
         connection.execute("UPDATE runs SET record_json = ? WHERE run_id = ?", ("{invalid", str(run.run_id)))
     with pytest.raises(ValidationError):
-        repository.claim(run.run_id)
+        repository.claim(run.run_id, "test-owner", 30)
     assert not connection.in_transaction
     observer = SQLiteRunRepository(repository.db_path)
     try:
@@ -218,7 +218,7 @@ def test_claim_rolls_back_invalid_json_and_releases_write_lock(repository):
     finally:
         observer.close()
     repository.save(run)
-    assert repository.claim(run.run_id).status == "running"
+    assert repository.claim(run.run_id, "test-owner", 30).run.status == "running"
 
 
 def test_claim_requires_exactly_one_updated_row(repository):
@@ -229,10 +229,10 @@ def test_claim_requires_exactly_one_updated_row(repository):
         CREATE TRIGGER ignore_claim BEFORE UPDATE ON runs WHEN NEW.status = 'running'
         BEGIN SELECT RAISE(IGNORE); END
     """)
-    assert repository.claim(run.run_id) is None
+    assert repository.claim(run.run_id, "test-owner", 30) is None
     assert not connection.in_transaction and repository.get(run.run_id) == run
     connection.execute("DROP TRIGGER ignore_claim")
-    assert repository.claim(run.run_id).status == "running"
+    assert repository.claim(run.run_id, "test-owner", 30).run.status == "running"
 
 
 def test_claim_initializes_lazily_and_respects_closed_repository(tmp_path):
@@ -240,15 +240,15 @@ def test_claim_initializes_lazily_and_respects_closed_repository(tmp_path):
     repository = SQLiteRunRepository(path)
     try:
         assert not path.exists()
-        assert repository.claim(uuid4()) is None and path.exists()
+        assert repository.claim(uuid4(), "test-owner", 30) is None and path.exists()
         assert not repository._connection.in_transaction
         repository.close()
         with pytest.raises(RuntimeError, match="关闭"):
-            repository.claim(uuid4())
+            repository.claim(uuid4(), "test-owner", 30)
         repository.initialize()
         run = RunRecord(message="模拟重新初始化")
         repository.save(run)
-        assert repository.claim(run.run_id).status == "running"
+        assert repository.claim(run.run_id, "test-owner", 30).run.status == "running"
     finally:
         repository.close()
 
@@ -271,7 +271,7 @@ def test_claim_has_exactly_one_winner_across_thread_connections(tmp_path, compet
         try:
             repository.initialize()
             barrier.wait(timeout=5)
-            claimed = repository.claim(run.run_id)
+            claimed = repository.claim(run.run_id, f"thread-{threading.get_ident()}", 30)
             assert not repository._connection.in_transaction
             return threading.get_ident(), claimed
         finally:
@@ -283,8 +283,8 @@ def test_claim_has_exactly_one_winner_across_thread_connections(tmp_path, compet
     assert len({thread_id for thread_id, _ in outcomes}) == competitors
     winners = [claimed for _, claimed in outcomes if claimed is not None]
     assert len(winners) == 1 and sum(claimed is None for _, claimed in outcomes) == competitors - 1
-    assert winners[0].status == "running" and winners[0].completed_at is None
+    assert winners[0].run.status == "running" and winners[0].run.completed_at is None
     with closing(sqlite3.connect(path)) as observer:
         status, completed_at, record_json = observer.execute("SELECT status, completed_at, record_json FROM runs").fetchone()
         assert status == "running" and completed_at is None
-        assert RunRecord.model_validate_json(record_json) == winners[0]
+        assert RunRecord.model_validate_json(record_json) == winners[0].run

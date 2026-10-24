@@ -309,12 +309,12 @@ async def test_worker_outer_failure_is_persisted_and_next_run_executes(
             raise RuntimeError("DO_NOT_EXPOSE_INTERNAL_DETAILS")
         return await execute(run_id)
 
-    def fail_claim(run_id):
+    def fail_claim(run_id, owner_id, lease_seconds):
         nonlocal triggered
         if not triggered:
             triggered = True
             raise sqlite3.OperationalError("DO_NOT_EXPOSE_INTERNAL_DETAILS")
-        return claim(run_id)
+        return claim(run_id, owner_id, lease_seconds)
 
     if failure == "before_running":
         monkeypatch.setattr(service.repository, "claim", fail_claim)
@@ -396,17 +396,17 @@ async def test_progress_save_failure_cleans_parallel_children_and_worker_continu
     monkeypatch.setattr("main.get_traffic", traffic)
     app = create_app(planner, db_path=tmp_path / "save-failure.sqlite")
     service = app.state.run_service
-    save = service.repository.save
+    save = service.repository.save_claimed
     triggered = False
 
-    def fail_once(run):
+    def fail_once(run, owner_id, token):
         nonlocal triggered
         if not triggered and run.tool_executions and run.tool_executions[0].status == "succeeded":
             triggered = True
             raise sqlite3.OperationalError("模拟保存步骤结果失败")
-        save(run)
+        save(run, owner_id, token)
 
-    monkeypatch.setattr(service.repository, "save", fail_once)
+    monkeypatch.setattr(service.repository, "save_claimed", fail_once)
     async with client_factory(app) as client:
         response = await client.post("/runs", json={"message": MESSAGES[1]})
         failed = await client.completed_run(response)
@@ -447,16 +447,16 @@ async def test_shutdown_cancellation_survives_failed_terminal_save(
     monkeypatch.setattr("main.find_warning", handler)
     app = create_app(planner, db_path=path)
     service = app.state.run_service
-    save, get = service.repository.save, service.queue.get
+    save, get = service.repository.save_claimed, service.queue.get
     cancel_save_attempts, get_calls = 0, 0
 
-    def fail_cancel_save(run):
+    def fail_cancel_save(run, owner_id, token):
         nonlocal cancel_save_attempts
         if run.error is not None and run.error.code == "CANCELLED":
             cancel_save_attempts += 1
             if persistent_failure or cancel_save_attempts == 1:
                 raise sqlite3.OperationalError("模拟取消终态保存失败")
-        save(run)
+        save(run, owner_id, token)
 
     async def observed_get():
         nonlocal get_calls
@@ -465,7 +465,7 @@ async def test_shutdown_cancellation_survives_failed_terminal_save(
             reentered_get.set()
         return await get()
 
-    monkeypatch.setattr(service.repository, "save", fail_cancel_save)
+    monkeypatch.setattr(service.repository, "save_claimed", fail_cancel_save)
     monkeypatch.setattr(service.queue, "get", observed_get)
     lifetime = client_factory(app)
     client = await lifetime.__aenter__()
@@ -503,7 +503,7 @@ async def test_shutdown_cancellation_survives_failed_terminal_save(
             observer.close()
     finally:
         # 即使旧实现回归，也能结束失败测试，不让 pytest 遗留后台任务。
-        monkeypatch.setattr(service.repository, "save", save)
+        monkeypatch.setattr(service.repository, "save_claimed", save)
         if reentered is not None:
             reentered.cancel()
             await asyncio.gather(reentered, return_exceptions=True)
@@ -529,17 +529,17 @@ async def test_child_cancellation_keeps_cancelled_code_when_terminal_save_fails(
     monkeypatch.setattr("main.find_warning", handler)
     app = create_app(planner, db_path=tmp_path / "child-cancel-save.sqlite")
     service = app.state.run_service
-    save = service.repository.save
+    save = service.repository.save_claimed
     failures = 0
 
-    def fail_once(run):
+    def fail_once(run, owner_id, token):
         nonlocal failures
         if failures == 0 and run.error is not None and run.error.code == "CANCELLED":
             failures += 1
             raise sqlite3.OperationalError("模拟取消终态保存失败")
-        save(run)
+        save(run, owner_id, token)
 
-    monkeypatch.setattr(service.repository, "save", fail_once)
+    monkeypatch.setattr(service.repository, "save_claimed", fail_once)
     async with client_factory(app) as client:
         worker = service._worker_task
         response = await client.post("/runs", json={"message": MESSAGES[0]})
@@ -557,17 +557,17 @@ async def test_terminal_save_failure_without_cancellation_is_not_suppressed(
 ):
     app = create_app(planner, db_path=tmp_path / "terminal-save.sqlite")
     service = app.state.run_service
-    save = service.repository.save
+    save = service.repository.save_claimed
     failures = 0
 
-    def fail_once(run):
+    def fail_once(run, owner_id, token):
         nonlocal failures
         if failures == 0 and run.status == "succeeded":
             failures += 1
             raise sqlite3.OperationalError("模拟正常终态保存失败")
-        save(run)
+        save(run, owner_id, token)
 
-    monkeypatch.setattr(service.repository, "save", fail_once)
+    monkeypatch.setattr(service.repository, "save_claimed", fail_once)
     async with client_factory(app) as client:
         response = await client.post("/runs", json={"message": MESSAGES[0]})
         saved = await client.completed_run(response)
@@ -613,8 +613,8 @@ async def test_two_services_recover_same_run_but_only_claim_winner_executes(
         service = app.state.run_service
         claim, execute_run, execute_tool = service.repository.claim, service.execute_run, service.runtime.execute
 
-        def observed_claim(run_id):
-            claimed = claim(run_id)
+        def observed_claim(run_id, owner_id, lease_seconds):
+            claimed = claim(run_id, owner_id, lease_seconds)
             claim_outcomes[label].append(claimed is not None)
             return claimed
 
@@ -640,7 +640,8 @@ async def test_two_services_recover_same_run_but_only_claim_winner_executes(
         try:
             # 两个 Worker 都从启动恢复队列取得同一个 ID，再一起放行 Claim。
             await asyncio.wait_for(asyncio.gather(*(event.wait() for event in restored.values())), timeout=2)
-            assert all(service._enqueued_ids == {run.run_id} for service in services.values())
+            assert all(service._active_ids == {run.run_id} and service._enqueued_ids == set()
+                       for service in services.values())
             assert services["first"].get_run(run.run_id).status == "queued"
             permit_claims.set()
             await asyncio.wait_for(planner_started.wait(), timeout=1)
@@ -719,9 +720,9 @@ async def test_execute_run_without_claim_returns_snapshot_or_missing_without_exe
     monkeypatch.setattr(service.runtime, "execute", forbidden_runtime)
     claim = service.repository.claim
 
-    def observed_claim(run_id):
+    def observed_claim(run_id, owner_id, lease_seconds):
         calls["claim"] += 1
-        return claim(run_id)
+        return claim(run_id, owner_id, lease_seconds)
 
     monkeypatch.setattr(service.repository, "claim", observed_claim)
     run = RunRecord(message="模拟不可领取", status=status or "queued", answer="保留模拟结果")

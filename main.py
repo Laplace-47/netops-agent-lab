@@ -19,7 +19,10 @@ from netops_agent.tools import (
 )
 
 
-def create_app(planner: Planner | None = None, *, db_path: str | Path = ":memory:") -> FastAPI:
+def create_app(
+    planner: Planner | None = None, *, db_path: str | Path = ":memory:",
+    lease_seconds: float = 30.0, heartbeat_interval: float = 10.0, reaper_interval: float = 1.0,
+) -> FastAPI:
     registry = ToolRegistry()
     registry.register(ToolDefinition(
         name="find_warning",
@@ -43,7 +46,8 @@ def create_app(planner: Planner | None = None, *, db_path: str | Path = ":memory
     ))
     planner = planner or MockPlanner(timezone_name=os.getenv("NETOPS_TIMEZONE", "Asia/Shanghai"))
     repository = SQLiteRunRepository(db_path)
-    service = RunService(planner, ToolRuntime(registry), repository)
+    service = RunService(planner, ToolRuntime(registry), repository, lease_seconds=lease_seconds,
+                         heartbeat_interval=heartbeat_interval, reaper_interval=reaper_interval)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
